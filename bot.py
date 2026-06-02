@@ -16,9 +16,9 @@ SCAN_INTERVAL      = int(os.environ.get("SCAN_INTERVAL", "30"))
 # ─── INSTRUMENTS (PU Prime Islamic Standard) ──────────────
 INSTRUMENTS = [
     {"id": "XAUUSD", "label": "Gold",    "symbol": "XAU/USD",  "decimals": 2,  "sl_dist": 3.5,   "td": True, "priority": 1},
-    {"id": "NAS100", "label": "Nasdaq",  "symbol": "IXIC",     "decimals": 1,  "sl_dist": 20.0,  "td": True, "priority": 2},
+    {"id": "NAS100", "label": "Nasdaq",  "symbol": "NDX",      "decimals": 1,  "sl_dist": 20.0,  "td": True, "priority": 2},
     {"id": "EURUSD", "label": "EUR/USD", "symbol": "EUR/USD",  "decimals": 5,  "sl_dist": 0.0015,"td": True, "priority": 3},
-    {"id": "USOUSD", "label": "WTI Oil", "symbol": "WTI/USD",  "decimals": 2,  "sl_dist": 0.8,   "td": True, "priority": 4},
+    {"id": "USOUSD", "label": "WTI Oil", "symbol": "USO",      "decimals": 2,  "sl_dist": 0.8,   "td": True, "priority": 4},
 ]
 
 # ─── STATE ────────────────────────────────────────────────
