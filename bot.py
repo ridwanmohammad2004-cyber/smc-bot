@@ -30,7 +30,7 @@ INSTRUMENTS = [
     {"id": "EURUSD", "label": "EUR/USD", "symbol": "EUR/USD",  "decimals": 5,  "sl_dist": 0.0015,"priority": 3, "ws": True,
      "lot_strong": 0.03, "lot_mid": 0.02, "valid_min": 0.5,   "valid_max": 2.0},
     {"id": "USOUSD", "label": "WTI Oil", "symbol": "WTI/USD",  "decimals": 2,  "sl_dist": 0.8,   "priority": 4, "ws": False,
-     "lot_strong": 0.03, "lot_mid": 0.02, "valid_min": 30,    "valid_max": 130},
+     "lot_strong": 0.03, "lot_mid": 0.02, "valid_min": 30,    "valid_max": 130,  "buy_only": True},
 ]
 SYMBOL_TO_ID = {i["symbol"]: i["id"] for i in INSTRUMENTS}
 
@@ -39,6 +39,8 @@ price_history    = {i["id"]: [] for i in INSTRUMENTS}
 latest_price     = {i["id"]: None for i in INSTRUMENTS}
 last_signals     = {i["id"]: None for i in INSTRUMENTS}
 last_signal_time = {i["id"]: None for i in INSTRUMENTS}
+# Track open signals for TP/SL monitoring
+open_signals = {}  # {inst_id: {"direction": "BUY/SELL", "entry": x, "sl": x, "tp1": x, "tp2": x, "tp1_hit": False}}
 # Per-instrument cooldown in seconds
 COOLDOWNS = {
     "XAUUSD": 420,   # 7 minutes
@@ -427,16 +429,24 @@ def check_telegram_commands():
             msg = u.get("message", {}).get("text", "").strip().lower()
             if msg in ("/status", "status"):
                 send_status()
-            elif msg in ("/help", "help"):
+            elif msg in ("/help", "help", "prompts"):
                 send_telegram(
                     "📋 *SMC Bot Commands*\n\n"
                     "`status` — Live bot status\n"
-                    "`markets` — Active/paused markets\n"
-                    "`pause XAUUSD` — Pause a market\n"
-                    "`pause all` — Pause everything\n"
-                    "`resume XAUUSD` — Resume a market\n"
-                    "`resume all` — Resume all\n"
-                    "`help` — This menu"
+                    "`markets` — Active/paused markets with prices\n"
+                    "`pause XAUUSD` — Pause Gold signals\n"
+                    "`pause NAS100` — Pause Nasdaq signals\n"
+                    "`pause EURUSD` — Pause EUR/USD signals\n"
+                    "`pause USOUSD` — Pause Oil signals\n"
+                    "`pause all` — Pause all markets\n"
+                    "`resume XAUUSD` — Resume Gold signals\n"
+                    "`resume all` — Resume all markets\n"
+                    "`xauusd` — Get live Gold price\n"
+                    "`nas100` — Get live Nasdaq price\n"
+                    "`eurusd` — Get live EUR/USD price\n"
+                    "`usousd` — Get live Oil price\n"
+                    "`prompts` — Show this menu\n"
+                    "`help` — Show this menu"
                 )
             elif msg.startswith("pause"):
                 parts = msg.split()
@@ -466,6 +476,26 @@ def check_telegram_commands():
                     pr = round(pr, i["decimals"]) if pr else "N/A"
                     lines.append(f"{st} — `{i['id']}` @ `{pr}`")
                 send_telegram("📊 *Market Status*\n\n" + "\n".join(lines))
+            else:
+                # Check if message is an instrument name — return live price
+                inst_lookup = {i["id"].lower(): i for i in INSTRUMENTS}
+                if msg in inst_lookup:
+                    i = inst_lookup[msg]
+                    price = latest_price[i["id"]]
+                    if price:
+                        dec = i["decimals"]
+                        spread = i["sl_dist"] * 0.1
+                        buy_p  = round(price + spread, dec)
+                        sell_p = round(price - spread, dec)
+                        send_telegram(
+                            "*" + i["id"] + "* (" + i["label"] + ")\n"
+                            "━━━━━━━━━━━━━━\n"
+                            "BUY:  `" + str(buy_p) + "`\n"
+                            "SELL: `" + str(sell_p) + "`\n"
+                            "_Live price — approximate spread_"
+                        )
+                    else:
+                        send_telegram("No price data yet for `" + i["id"] + "` — try again in a moment.")
     except Exception as e:
         log.warning(f"Command error: {e}")
 
@@ -547,6 +577,72 @@ def reset_daily_stats():
         last_reset_day = today
         announced_sessions.clear()
 
+
+
+# ─── TP/SL MONITOR ────────────────────────────────────────
+def check_tp_sl(inst, current_price):
+    inst_id = inst["id"]
+    if inst_id not in open_signals:
+        return
+    sig = open_signals[inst_id]
+    direction = sig["direction"]
+    dec = inst["decimals"]
+    price = current_price
+
+    if direction == "BUY":
+        if not sig["tp1_hit"] and price >= sig["tp1"]:
+            sig["tp1_hit"] = True
+            send_telegram(
+                "*TP1 HIT — " + inst_id + "* (" + inst["label"] + ")\n"
+                "Price reached `" + str(round(price, dec)) + "`\n"
+                "TP1 was `" + str(sig["tp1"]) + "`\n"
+                "━━━━━━━━━━━━━━\n"
+                "_Move SL to breakeven now._\n"
+                "TP2 still open at `" + str(sig["tp2"]) + "`"
+            )
+        elif sig["tp1_hit"] and price >= sig["tp2"]:
+            send_telegram(
+                "*TP2 HIT — " + inst_id + "* (" + inst["label"] + ")\n"
+                "Price reached `" + str(round(price, dec)) + "`\n"
+                "Full target reached — close trade!"
+            )
+            del open_signals[inst_id]
+        elif price <= sig["sl"]:
+            send_telegram(
+                "*SL HIT — " + inst_id + "* (" + inst["label"] + ")\n"
+                "Price dropped to `" + str(round(price, dec)) + "`\n"
+                "SL was `" + str(sig["sl"]) + "`\n"
+                "_Small loss — stay disciplined._"
+            )
+            del open_signals[inst_id]
+
+    elif direction == "SELL":
+        if not sig["tp1_hit"] and price <= sig["tp1"]:
+            sig["tp1_hit"] = True
+            send_telegram(
+                "*TP1 HIT — " + inst_id + "* (" + inst["label"] + ")\n"
+                "Price reached `" + str(round(price, dec)) + "`\n"
+                "TP1 was `" + str(sig["tp1"]) + "`\n"
+                "━━━━━━━━━━━━━━\n"
+                "_Move SL to breakeven now._\n"
+                "TP2 still open at `" + str(sig["tp2"]) + "`"
+            )
+        elif sig["tp1_hit"] and price <= sig["tp2"]:
+            send_telegram(
+                "*TP2 HIT — " + inst_id + "* (" + inst["label"] + ")\n"
+                "Price reached `" + str(round(price, dec)) + "`\n"
+                "Full target reached — close trade!"
+            )
+            del open_signals[inst_id]
+        elif price >= sig["sl"]:
+            send_telegram(
+                "*SL HIT — " + inst_id + "* (" + inst["label"] + ")\n"
+                "Price rose to `" + str(round(price, dec)) + "`\n"
+                "SL was `" + str(sig["sl"]) + "`\n"
+                "_Small loss — stay disciplined._"
+            )
+            del open_signals[inst_id]
+
 # ─── ANALYSIS LOOP ────────────────────────────────────────
 def analysis_loop():
     while True:
@@ -563,6 +659,8 @@ def analysis_loop():
                         hist.append(price)
                         if len(hist) > 150:
                             hist.pop(0)
+                    # Check TP/SL on every price update
+                    check_tp_sl(inst, price)
 
                 analysis = analyze(price_history[inst["id"]], inst)
                 sig = analysis["signal"]
@@ -586,6 +684,15 @@ def analysis_loop():
                         stats["signals_today"] += 1
                         stats["last_signal_sent"] = now_t
                         stats["last_heartbeat"] = now_t
+                        # Store for TP/SL monitoring
+                        open_signals[inst["id"]] = {
+                            "direction": sig,
+                            "entry": analysis["entry"],
+                            "sl":    analysis["sl"],
+                            "tp1":   analysis["tp1"],
+                            "tp2":   analysis["tp2"],
+                            "tp1_hit": False,
+                        }
                 elif sig == "WAIT" and prev_sig in ("BUY", "SELL"):
                     last_signals[inst["id"]] = "WAIT"
                     send_telegram(
@@ -606,7 +713,7 @@ def main():
     log.info("SMC Signal Bot v3 (WebSocket) — Starting")
     send_telegram(
         "✅ *SMC Signal Bot v3 Online*\n"
-        f"📊 Monitoring: `XAUUSD | NAS100 | EURUSD | USOUSD`\n"
+        f"📊 Monitoring: `XAUUSD | NAS100 | EURUSD`\n"
         f"📡 XAUUSD + EURUSD: `WebSocket (real-time)`\n"
         f"📡 NAS100 + USOUSD: `REST (8s)`\n"
         f"⚡ Analysis every: `{ANALYZE_INTERVAL}s`\n"
