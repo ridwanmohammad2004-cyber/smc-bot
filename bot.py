@@ -638,8 +638,7 @@ def process_signal(inst, price):
         elif sig == "WAIT" and prev_sig in ("BUY", "SELL"):
             last_signals[inst["id"]] = "WAIT"
             send_telegram(
-                f"⏸ *{inst['id']}* signal cleared — now `WAIT`
-"
+                f"⏸ *{inst['id']}* signal cleared — now `WAIT`\n"
                 f"_Previous signal no longer valid. Don't enter if not already in trade._"
             )
     except Exception as e:
