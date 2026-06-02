@@ -3,6 +3,7 @@ import time
 import requests
 import logging
 from datetime import datetime, timezone, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
@@ -604,40 +605,65 @@ def format_signal(inst, analysis):
     )
 
 # ─── MAIN SCAN ────────────────────────────────────────────
+def fetch_single(inst):
+    """Fetch price for a single instrument — runs in parallel."""
+    if inst["id"] in paused_markets:
+        return inst, None
+    price = get_price(inst)
+    return inst, price
+
+def process_signal(inst, price):
+    """Process signal for one instrument after price fetch."""
+    try:
+        if price and price > 0:
+            price_history[inst["id"]].append(price)
+            if len(price_history[inst["id"]]) > 150:
+                price_history[inst["id"]].pop(0)
+
+        analysis = analyze(price_history[inst["id"]], inst)
+        sig      = analysis["signal"]
+        prev_sig = last_signals[inst["id"]]
+
+        log.info(f"{inst['id']} | {price} | {sig} | {analysis.get('reason','')}")
+
+        if sig != "WAIT" and sig != prev_sig:
+            last_signals[inst["id"]]     = sig
+            last_signal_time[inst["id"]] = datetime.now(timezone.utc)
+            msg = format_signal(inst, analysis)
+            send_telegram(msg)
+            stats["signals_today"]    += 1
+            stats["last_signal_sent"]  = datetime.now(timezone.utc)
+            stats["last_heartbeat"]    = datetime.now(timezone.utc)
+
+        elif sig == "WAIT" and prev_sig in ("BUY", "SELL"):
+            last_signals[inst["id"]] = "WAIT"
+            send_telegram(
+                f"⏸ *{inst['id']}* signal cleared — now `WAIT`
+"
+                f"_Previous signal no longer valid. Don't enter if not already in trade._"
+            )
+    except Exception as e:
+        log.error(f"Error processing {inst['id']}: {e}")
+
 def scan():
+    """Fetch all instruments in parallel then process signals."""
     stats["last_scan"] = datetime.now(timezone.utc)
-    for inst in INSTRUMENTS:
-        try:
-            if inst["id"] in paused_markets:
-                log.info(f"{inst['id']} | PAUSED — skipping")
-                continue
-            price = get_price(inst)
-            if price and price > 0:
-                price_history[inst["id"]].append(price)
-                if len(price_history[inst["id"]]) > 150:
-                    price_history[inst["id"]].pop(0)
+    active = [i for i in INSTRUMENTS if i["id"] not in paused_markets]
 
-            analysis = analyze(price_history[inst["id"]], inst)
-            sig      = analysis["signal"]
-            prev_sig = last_signals[inst["id"]]
+    # Fetch all prices simultaneously
+    results = {}
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {executor.submit(fetch_single, inst): inst for inst in active}
+        for future in as_completed(futures):
+            try:
+                inst, price = future.result()
+                results[inst["id"]] = (inst, price)
+            except Exception as e:
+                log.error(f"Parallel fetch error: {e}")
 
-            log.info(f"{inst['id']} | {price} | {sig} | {analysis.get('reason','')}")
-
-            if sig != "WAIT" and sig != prev_sig:
-                last_signals[inst["id"]]    = sig
-                last_signal_time[inst["id"]]= datetime.now(timezone.utc)
-                msg = format_signal(inst, analysis)
-                send_telegram(msg)
-                stats["signals_today"] += 1
-                stats["last_signal_sent"] = datetime.now(timezone.utc)
-                stats["last_heartbeat"]   = datetime.now(timezone.utc)
-
-            elif sig == "WAIT" and prev_sig in ("BUY", "SELL"):
-                last_signals[inst["id"]] = "WAIT"
-                send_telegram(f"⏸ *{inst['id']}* signal cleared — now `WAIT`")
-
-        except Exception as e:
-            log.error(f"Error scanning {inst['id']}: {e}")
+    # Process signals sequentially after all prices fetched
+    for inst_id, (inst, price) in results.items():
+        process_signal(inst, price)
 
 # ─── RESET DAILY STATS ────────────────────────────────────
 last_reset_day = None
@@ -653,7 +679,7 @@ def reset_daily_stats():
 def main():
     log.info("SMC Signal Bot v2 — Starting")
     send_telegram(
-        "✅ *SMC Signal Bot v2 Online*\n"
+        "✅ *yoordz SMC Signal Bot v2 Online*\n"
         f"📊 Monitoring: `XAUUSD | NAS100 | EURUSD | USOUSD`\n"
         f"🔄 Scan every: `{SCAN_INTERVAL}s`\n"
         f"⭐ Signal ratings: `STRONG 🔥 / MID ⚡`\n"
