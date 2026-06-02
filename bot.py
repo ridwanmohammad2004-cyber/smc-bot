@@ -39,6 +39,13 @@ price_history    = {i["id"]: [] for i in INSTRUMENTS}
 latest_price     = {i["id"]: None for i in INSTRUMENTS}
 last_signals     = {i["id"]: None for i in INSTRUMENTS}
 last_signal_time = {i["id"]: None for i in INSTRUMENTS}
+# Per-instrument cooldown in seconds
+COOLDOWNS = {
+    "XAUUSD": 420,   # 7 minutes
+    "NAS100": 600,   # 10 minutes
+    "EURUSD": 600,   # 10 minutes
+    "USOUSD": 600,   # 10 minutes
+}
 stats = {
     "signals_today": 0,
     "last_scan": None,
@@ -248,13 +255,15 @@ def get_structure(prices):
     return "RANGING"
 
 def rate_signal(factors):
-    score = sum(factors.values())
-    pct = score / len(factors)
-    if pct >= 0.75:
+    score = sum(factors.values())  # number of True factors
+    total = len(factors)
+    # STRONG: 75%+ of factors (and at least 4)
+    if score >= 4 and (score / total) >= 0.7:
         return "STRONG 🔥"
-    elif pct >= 0.5:
+    # MID: at least 3 factors aligned
+    elif score >= 3:
         return "MID ⚡"
-    return None
+    return None  # fewer than 3 factors = skip (too weak)
 
 def analyze(prices, inst):
     if len(prices) < 12:
@@ -266,7 +275,7 @@ def analyze(prices, inst):
     rng_pct = ((high - low) / last) * 100
     dec, sl = inst["decimals"], inst["sl_dist"]
 
-    min_range = 0.03 if inst["id"] == "EURUSD" else 0.10
+    min_range = 0.04 if inst["id"] == "EURUSD" else 0.14
     if rng_pct < min_range:
         return {"signal": "WAIT", "reason": "Consolidating — no volatility"}
     if abs(momentum) > inst["sl_dist"] * 1.8:
@@ -561,12 +570,22 @@ def analysis_loop():
                 log.info(f"{inst['id']} | {price} | {sig} | {analysis.get('reason','')}")
 
                 if sig != "WAIT" and sig != prev_sig:
-                    last_signals[inst["id"]] = sig
-                    last_signal_time[inst["id"]] = datetime.now(timezone.utc)
-                    send_telegram(format_signal(inst, analysis))
-                    stats["signals_today"] += 1
-                    stats["last_signal_sent"] = datetime.now(timezone.utc)
-                    stats["last_heartbeat"] = datetime.now(timezone.utc)
+                    # Cooldown check — prevent signal spam on same instrument
+                    now_t = datetime.now(timezone.utc)
+                    last_t = last_signal_time[inst["id"]]
+                    cd = COOLDOWNS.get(inst["id"], 600)
+                    in_cooldown = last_t and (now_t - last_t).total_seconds() < cd
+                    if in_cooldown:
+                        remaining = int((cd - (now_t - last_t).total_seconds()) / 60)
+                        log.info(f"{inst['id']} | {sig} suppressed — cooldown {remaining}m left")
+                        last_signals[inst["id"]] = sig  # update state but don't send
+                    else:
+                        last_signals[inst["id"]] = sig
+                        last_signal_time[inst["id"]] = now_t
+                        send_telegram(format_signal(inst, analysis))
+                        stats["signals_today"] += 1
+                        stats["last_signal_sent"] = now_t
+                        stats["last_heartbeat"] = now_t
                 elif sig == "WAIT" and prev_sig in ("BUY", "SELL"):
                     last_signals[inst["id"]] = "WAIT"
                     send_telegram(
