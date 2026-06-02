@@ -2,262 +2,552 @@ import os
 import time
 import requests
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
 
-# ─── CONFIG (set these in Railway environment variables) ───
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+# ─── CONFIG ───────────────────────────────────────────────
+TELEGRAM_TOKEN     = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "")
-SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL", "60"))  # seconds
+SCAN_INTERVAL      = int(os.environ.get("SCAN_INTERVAL", "60"))
 
-# ─── INSTRUMENTS ───────────────────────────────────────────
-# TwelveData free tier supports: XAU/USD, EUR/USD
-# NAS100 and Oil fall back to Yahoo Finance automatically
+# ─── INSTRUMENTS (PU Prime Islamic Standard) ──────────────
 INSTRUMENTS = [
-    {"id": "XAUUSD", "label": "Gold",    "symbol": "XAU/USD",  "decimals": 2, "sl_dist": 3.5,   "td": True},
-    {"id": "NAS100", "label": "Nasdaq",  "symbol": None,       "decimals": 1, "sl_dist": 15.0,  "td": False},
-    {"id": "USOUSD", "label": "WTI Oil", "symbol": None,       "decimals": 2, "sl_dist": 0.8,   "td": False},
-    {"id": "EURUSD", "label": "EUR/USD", "symbol": "EUR/USD",  "decimals": 5, "sl_dist": 0.0012,"td": True},
+    {"id": "XAUUSD", "label": "Gold",    "symbol": "XAU/USD", "decimals": 2,  "sl_dist": 3.5,   "td": True,  "priority": 1},
+    {"id": "NAS100", "label": "Nasdaq",  "symbol": None,      "decimals": 1,  "sl_dist": 20.0,  "td": False, "priority": 2},
+    {"id": "EURUSD", "label": "EUR/USD", "symbol": "EUR/USD", "decimals": 5,  "sl_dist": 0.0015,"td": True,  "priority": 3},
+    {"id": "USOUSD", "label": "WTI Oil", "symbol": None,      "decimals": 2,  "sl_dist": 0.8,   "td": False, "priority": 4},
 ]
 
-# ─── STATE ─────────────────────────────────────────────────
-price_history = {i["id"]: [] for i in INSTRUMENTS}
-last_signals  = {i["id"]: None for i in INSTRUMENTS}
+# ─── STATE ────────────────────────────────────────────────
+price_history   = {i["id"]: [] for i in INSTRUMENTS}
+last_signals    = {i["id"]: None for i in INSTRUMENTS}
+last_signal_time= {i["id"]: None for i in INSTRUMENTS}
+stats = {
+    "signals_today": 0,
+    "last_scan": None,
+    "start_time": datetime.now(timezone.utc),
+    "last_signal_sent": None,
+    "last_heartbeat": None,
+}
+announced_sessions = set()
+announced_market   = set()
 
-# ─── PRICE FETCHING ────────────────────────────────────────
-def fetch_price_twelvedata(symbol):
-    """Fetch latest price from TwelveData (free tier: 800 req/day)."""
+# ─── SESSIONS ─────────────────────────────────────────────
+SESSIONS = [
+    {"name": "Sydney",  "open": 22, "close": 7,  "emoji": "🇦🇺"},
+    {"name": "Tokyo",   "open": 0,  "close": 9,  "emoji": "🇯🇵"},
+    {"name": "London",  "open": 7,  "close": 16, "emoji": "🇬🇧"},
+    {"name": "New York","open": 12, "close": 21, "emoji": "🇺🇸"},
+]
+
+# ─── PRICE FETCHING ───────────────────────────────────────
+def fetch_twelvedata(symbol):
     try:
         url = f"https://api.twelvedata.com/price?symbol={symbol}&apikey={TWELVEDATA_API_KEY}"
         r = requests.get(url, timeout=10)
-        data = r.json()
-        if "price" in data:
-            return float(data["price"])
-        log.warning(f"TwelveData error for {symbol}: {data}")
+        d = r.json()
+        if "price" in d:
+            return float(d["price"])
     except Exception as e:
-        log.error(f"fetch_price error {symbol}: {e}")
+        log.error(f"TwelveData error {symbol}: {e}")
     return None
 
-def fetch_price_fallback_eurusd():
-    """Fallback FX rate from Frankfurter."""
+def fetch_yahoo(ticker):
+    try:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1m&range=5m"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        r = requests.get(url, headers=headers, timeout=10)
+        return float(r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"])
+    except:
+        return None
+
+def fetch_frankfurter():
     try:
         r = requests.get("https://api.frankfurter.app/latest?from=EUR&to=USD", timeout=10)
         return float(r.json()["rates"]["USD"])
     except:
         return None
 
-def fetch_price_fallback_gold():
-    """Fallback gold price from Yahoo Finance."""
-    try:
-        url = "https://query1.finance.yahoo.com/v8/finance/chart/GC%3DF?interval=1m&range=5m"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        r = requests.get(url, headers=headers, timeout=10)
-        return float(r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"])
-    except:
-        return None
-
-def fetch_price_fallback_oil():
-    try:
-        url = "https://query1.finance.yahoo.com/v8/finance/chart/CL%3DF?interval=1m&range=5m"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        r = requests.get(url, headers=headers, timeout=10)
-        return float(r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"])
-    except:
-        return None
-
-def fetch_price_fallback_nas():
-    try:
-        url = "https://query1.finance.yahoo.com/v8/finance/chart/%5EIXIC?interval=1m&range=5m"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        r = requests.get(url, headers=headers, timeout=10)
-        return float(r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"])
-    except:
-        return None
-
 def get_price(inst):
-    """Try TwelveData first (only for supported symbols), fall back to free sources."""
     if TWELVEDATA_API_KEY and inst.get("td") and inst.get("symbol"):
-        price = fetch_price_twelvedata(inst["symbol"])
-        if price:
-            return price
-    # Fallbacks
-    if inst["id"] == "EURUSD":
-        return fetch_price_fallback_eurusd()
-    elif inst["id"] == "XAUUSD":
-        return fetch_price_fallback_gold()
-    elif inst["id"] == "USOUSD":
-        return fetch_price_fallback_oil()
+        p = fetch_twelvedata(inst["symbol"])
+        if p: return p
+    if inst["id"] == "XAUUSD":
+        return fetch_yahoo("GC%3DF")
     elif inst["id"] == "NAS100":
-        return fetch_price_fallback_nas()
+        return fetch_yahoo("%5EIXIC")
+    elif inst["id"] == "USOUSD":
+        return fetch_yahoo("CL%3DF")
+    elif inst["id"] == "EURUSD":
+        return fetch_frankfurter()
     return None
 
-# ─── SMC SIGNAL ENGINE ─────────────────────────────────────
-def analyze(prices, inst):
-    if len(prices) < 8:
-        return {"signal": "WAIT", "reason": "Building price history..."}
+# ─── CHART PATTERN DETECTION ──────────────────────────────
+def detect_pattern(prices):
+    """Detect basic chart patterns from recent price history."""
+    if len(prices) < 20:
+        return None, None
 
-    recent   = prices[-8:]
-    last     = recent[-1]
-    prev     = recent[-2]
+    p = prices[-20:]
+    high = max(p)
+    low  = min(p)
+    mid  = (high + low) / 2
+    last = p[-1]
+
+    # Find local peaks and troughs
+    peaks  = [i for i in range(1, len(p)-1) if p[i] > p[i-1] and p[i] > p[i+1]]
+    troughs= [i for i in range(1, len(p)-1) if p[i] < p[i-1] and p[i] < p[i+1]]
+
+    if len(peaks) >= 2 and len(troughs) >= 1:
+        p1, p2 = p[peaks[-2]], p[peaks[-1]]
+        t1 = p[troughs[-1]]
+
+        # Double Top
+        if abs(p1 - p2) / p1 < 0.003 and last < t1:
+            return "Double Top", "SELL"
+
+        # Head & Shoulders
+        if len(peaks) >= 3:
+            left, head, right = p[peaks[-3]], p[peaks[-2]], p[peaks[-1]]
+            if head > left and head > right and abs(left - right) / left < 0.005:
+                if last < t1:
+                    return "Head & Shoulders", "SELL"
+
+    if len(troughs) >= 2 and len(peaks) >= 1:
+        t1_v, t2_v = p[troughs[-2]], p[troughs[-1]]
+        peak_v = p[peaks[-1]]
+
+        # Double Bottom
+        if abs(t1_v - t2_v) / t1_v < 0.003 and last > peak_v:
+            return "Double Bottom", "BUY"
+
+        # Inverted H&S
+        if len(troughs) >= 3:
+            left, head, right = p[troughs[-3]], p[troughs[-2]], p[troughs[-1]]
+            if head < left and head < right and abs(left - right) / left < 0.005:
+                if last > peak_v:
+                    return "Inverted H&S", "BUY"
+
+    # Bull Flag
+    recent_5 = p[-5:]
+    prev_5   = p[-10:-5]
+    if max(prev_5) > min(prev_5) * 1.003:  # strong prior move up
+        if max(recent_5) < max(prev_5) and min(recent_5) > min(prev_5) * 0.999:
+            return "Bull Flag", "BUY"
+
+    # Bear Flag
+    if min(prev_5) < max(prev_5) * 0.997:  # strong prior move down
+        if min(recent_5) > min(prev_5) and max(recent_5) < max(prev_5) * 1.001:
+            return "Bear Flag", "SELL"
+
+    # Bullish Wedge (compression into support)
+    if last > mid and (high - low) / last < 0.005:
+        return "Bullish Wedge", "BUY"
+
+    # Bearish Wedge
+    if last < mid and (high - low) / last < 0.005:
+        return "Bearish Wedge", "SELL"
+
+    return None, None
+
+# ─── LIQUIDITY SWEEP DETECTION ────────────────────────────
+def detect_liquidity_sweep(prices):
+    """Detect stop hunt / fake breakout pattern."""
+    if len(prices) < 15:
+        return None
+
+    recent = prices[-5:]
+    lookback = prices[-15:-5]
+
+    prev_high = max(lookback)
+    prev_low  = min(lookback)
+    last = prices[-1]
+    prev = prices[-2]
+
+    # Swept high then reversed down
+    if max(recent[:-1]) > prev_high and last < prev_high and last < prev:
+        return "SELL"  # liquidity sweep above = sell
+
+    # Swept low then reversed up
+    if min(recent[:-1]) < prev_low and last > prev_low and last > prev:
+        return "BUY"  # liquidity sweep below = buy
+
+    return None
+
+# ─── STRUCTURE ANALYSIS ───────────────────────────────────
+def get_structure(prices):
+    if len(prices) < 10:
+        return "UNKNOWN"
+    recent = prices[-10:]
+    highs  = [recent[i] for i in range(1, len(recent)-1) if recent[i] > recent[i-1] and recent[i] > recent[i+1]]
+    lows   = [recent[i] for i in range(1, len(recent)-1) if recent[i] < recent[i-1] and recent[i] < recent[i+1]]
+    if len(highs) >= 2 and len(lows) >= 2:
+        if highs[-1] > highs[-2] and lows[-1] > lows[-2]:
+            return "BULLISH"
+        if highs[-1] < highs[-2] and lows[-1] < lows[-2]:
+            return "BEARISH"
+    return "RANGING"
+
+# ─── SIGNAL RATING ────────────────────────────────────────
+def rate_signal(factors):
+    """Rate signal as STRONG or MID based on confluence factors."""
+    score = sum(factors.values())
+    total = len(factors)
+    pct   = score / total
+    if pct >= 0.75:
+        return "STRONG 🔥"
+    elif pct >= 0.5:
+        return "MID ⚡"
+    return None  # Too weak — don't send
+
+# ─── MAIN SIGNAL ENGINE ───────────────────────────────────
+def analyze(prices, inst):
+    if len(prices) < 12:
+        return {"signal": "WAIT", "reason": "Building history..."}
+
+    last     = prices[-1]
+    prev     = prices[-2]
     momentum = last - prev
+    recent   = prices[-12:]
     high     = max(recent)
     low      = min(recent)
     rng      = high - low
     rng_pct  = (rng / last) * 100
+    dec      = inst["decimals"]
+    sl       = inst["sl_dist"]
 
-    sl   = inst["sl_dist"]
-    tp1  = sl * 2
-    tp2  = sl * 4
-    dec  = inst["decimals"]
+    # ── Volatility filter ──
+    min_range = 0.03 if inst["id"] == "EURUSD" else 0.10
+    if rng_pct < min_range:
+        return {"signal": "WAIT", "reason": "Consolidating — no volatility"}
 
-    # Spike check
-    spike_thresh = 0.0015 if inst["id"] == "EURUSD" else (inst["sl_dist"] * 1.5)
+    # ── Spike filter ──
+    spike_thresh = inst["sl_dist"] * 1.8
     if abs(momentum) > spike_thresh:
-        return {"signal": "WAIT", "reason": "Post-spike — no trade"}
+        return {"signal": "WAIT", "reason": "Post-spike — wait for structure"}
 
-    # Choppy check
-    choppy_thresh = 0.04 if inst["id"] == "EURUSD" else 0.12
-    if rng_pct < choppy_thresh:
-        return {"signal": "WAIT", "reason": "Consolidating — no structure"}
+    # ── Structure ──
+    structure = get_structure(prices)
 
-    # Structure
+    # ── Liquidity sweep ──
+    liq_sweep = detect_liquidity_sweep(prices)
+
+    # ── Chart pattern ──
+    pattern, pattern_dir = detect_pattern(prices)
+
+    # ── Basic SMC structure ──
     mid      = (high + low) / 2
     h_recent = recent[-4:]
     h_old    = recent[:4]
+    bull_struct = h_recent[-1] > h_old[-1] and last > mid
+    bear_struct = h_recent[-1] < h_old[-1] and last < mid
+    bull_mom = momentum > 0 and (last - prices[-6]) > 0
+    bear_mom = momentum < 0 and (last - prices[-6]) < 0
 
-    hh_hl = h_recent[-1] > h_old[-1] and last > mid  # bullish structure
-    lh_ll = h_recent[-1] < h_old[-1] and last < mid  # bearish structure
+    prev_high = max(prices[-15:-3]) if len(prices) >= 15 else high
+    prev_low  = min(prices[-15:-3]) if len(prices) >= 15 else low
+    demand_retest = last <= prev_low * 1.0008 and bull_mom
+    supply_retest = last >= prev_high * 0.9992 and bear_mom
 
-    bull_mom = momentum > 0 and (last - recent[0]) > 0
-    bear_mom = momentum < 0 and (last - recent[0]) < 0
+    # ── Determine direction ──
+    buy_signal  = False
+    sell_signal = False
+    reasons     = []
 
-    prev_high = max(prices[-10:-2]) if len(prices) >= 10 else high
-    prev_low  = min(prices[-10:-2]) if len(prices) >= 10 else low
+    if liq_sweep == "BUY":
+        buy_signal = True
+        reasons.append("Liquidity sweep reversal")
+    elif liq_sweep == "SELL":
+        sell_signal = True
+        reasons.append("Liquidity sweep reversal")
 
-    demand_retest = last <= prev_low * 1.0005 and bull_mom
-    supply_retest = last >= prev_high * 0.9995 and bear_mom
+    if pattern_dir == "BUY":
+        buy_signal = True
+        reasons.append(f"{pattern} pattern")
+    elif pattern_dir == "SELL":
+        sell_signal = True
+        reasons.append(f"{pattern} pattern")
 
-    if hh_hl and bull_mom and demand_retest:
+    if bull_struct and bull_mom and demand_retest:
+        buy_signal = True
+        reasons.append("HH/HL + demand retest")
+
+    if bear_struct and bear_mom and supply_retest:
+        sell_signal = True
+        reasons.append("LH/LL + supply retest")
+
+    if not buy_signal and not sell_signal:
+        return {"signal": "WAIT", "reason": "No confluence setup"}
+
+    # ── Conflict check ──
+    if buy_signal and sell_signal:
+        return {"signal": "WAIT", "reason": "Conflicting signals"}
+
+    direction = "BUY" if buy_signal else "SELL"
+
+    # ── Structure alignment check ──
+    struct_aligned = (
+        (direction == "BUY"  and structure in ("BULLISH", "UNKNOWN")) or
+        (direction == "SELL" and structure in ("BEARISH", "UNKNOWN"))
+    )
+
+    # ── Rate signal ──
+    factors = {
+        "liquidity_sweep":  liq_sweep is not None,
+        "pattern":          pattern is not None,
+        "structure":        (bull_struct if direction=="BUY" else bear_struct),
+        "momentum":         (bull_mom if direction=="BUY" else bear_mom),
+        "retest":           (demand_retest if direction=="BUY" else supply_retest),
+        "struct_aligned":   struct_aligned,
+    }
+    rating = rate_signal(factors)
+    if not rating:
+        return {"signal": "WAIT", "reason": "Setup too weak — skipping"}
+
+    # ── Build signal ──
+    tp1_mult = 2.0
+    tp2_mult = 3.5
+    if "STRONG" in rating:
+        tp2_mult = 4.5
+
+    if direction == "BUY":
         return {
-            "signal": "BUY",
-            "entry":  round(last, dec),
-            "sl":     round(last - sl, dec),
-            "tp1":    round(last + tp1, dec),
-            "tp2":    round(last + tp2, dec),
-            "reason": "HH/HL structure + demand retest"
+            "signal":  "BUY",
+            "rating":  rating,
+            "entry":   round(last, dec),
+            "sl":      round(last - sl, dec),
+            "tp1":     round(last + sl * tp1_mult, dec),
+            "tp2":     round(last + sl * tp2_mult, dec),
+            "rr":      f"1:{tp1_mult}",
+            "reason":  " + ".join(reasons),
+            "structure": structure,
+        }
+    else:
+        return {
+            "signal":  "SELL",
+            "rating":  rating,
+            "entry":   round(last, dec),
+            "sl":      round(last + sl, dec),
+            "tp1":     round(last - sl * tp1_mult, dec),
+            "tp2":     round(last - sl * tp2_mult, dec),
+            "rr":      f"1:{tp1_mult}",
+            "reason":  " + ".join(reasons),
+            "structure": structure,
         }
 
-    if lh_ll and bear_mom and supply_retest:
-        return {
-            "signal": "SELL",
-            "entry":  round(last, dec),
-            "sl":     round(last + sl, dec),
-            "tp1":    round(last - tp1, dec),
-            "tp2":    round(last - tp2, dec),
-            "reason": "LH/LL structure + supply retest"
-        }
-
-    return {"signal": "WAIT", "reason": "No high-probability setup"}
-
-# ─── TELEGRAM ──────────────────────────────────────────────
-def send_telegram(text):
+# ─── TELEGRAM ─────────────────────────────────────────────
+def send_telegram(text, parse_mode="Markdown"):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram not configured.")
         return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload = {
+        r = requests.post(url, json={
             "chat_id": TELEGRAM_CHAT_ID,
             "text": text,
-            "parse_mode": "Markdown"
-        }
-        r = requests.post(url, json=payload, timeout=10)
+            "parse_mode": parse_mode
+        }, timeout=10)
         if not r.json().get("ok"):
-            log.warning(f"Telegram send failed: {r.text}")
+            log.warning(f"Telegram failed: {r.text}")
     except Exception as e:
         log.error(f"Telegram error: {e}")
 
-def format_signal_message(inst, analysis, price):
-    now = datetime.now(timezone.utc).strftime("%H:%M UTC")
-    if analysis["signal"] == "BUY":
-        emoji = "🟢"
-    elif analysis["signal"] == "SELL":
-        emoji = "🔴"
-    else:
-        emoji = "🟡"
+def check_telegram_commands():
+    """Poll Telegram for /status command."""
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?timeout=1&offset=-1"
+        r = requests.get(url, timeout=5)
+        updates = r.json().get("result", [])
+        for u in updates:
+            msg = u.get("message", {}).get("text", "").strip().lower()
+            if msg in ("/status", "status"):
+                send_status()
+    except:
+        pass
 
-    if analysis["signal"] in ("BUY", "SELL"):
-        return (
-            f"{emoji} *{analysis['signal']} — {inst['id']}* ({inst['label']})\n"
-            f"⏰ `{now}`\n"
-            f"━━━━━━━━━━━━━━\n"
-            f"📍 Entry:  `{analysis['entry']}`\n"
-            f"🛑 SL:     `{analysis['sl']}`\n"
-            f"🎯 TP1:    `{analysis['tp1']}`\n"
-            f"🎯 TP2:    `{analysis['tp2']}`\n"
-            f"━━━━━━━━━━━━━━\n"
-            f"📊 _{analysis['reason']}_\n"
-            f"⚠️ _Confirm on your chart before trading_"
-        )
-    return None  # Don't send WAIT signals to Telegram (too noisy)
+def send_status():
+    now = datetime.now(timezone.utc)
+    uptime = now - stats["start_time"]
+    hours, rem = divmod(int(uptime.total_seconds()), 3600)
+    mins = rem // 60
+    last_scan_str = stats["last_scan"].strftime("%H:%M:%S UTC") if stats["last_scan"] else "N/A"
+    last_sig_str  = stats["last_signal_sent"].strftime("%H:%M UTC") if stats["last_signal_sent"] else "None today"
 
-# ─── MAIN LOOP ─────────────────────────────────────────────
-def scan():
-    log.info("Running scan...")
+    active_session = get_active_session(now)
+
+    msg = (
+        f"✅ *Bot Online*\n"
+        f"🕐 Time: `{now.strftime('%H:%M:%S UTC')}`\n"
+        f"⏱ Uptime: `{hours}h {mins}m`\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"📊 Markets: `XAUUSD | NAS100 | EURUSD | USOUSD`\n"
+        f"🔄 Status: `Monitoring`\n"
+        f"🕵️ Last scan: `{last_scan_str}`\n"
+        f"📡 Scan interval: `{SCAN_INTERVAL}s`\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"🌍 Session: `{active_session}`\n"
+        f"📨 Signals today: `{stats['signals_today']}`\n"
+        f"⏰ Last signal: `{last_sig_str}`\n"
+    )
+    send_telegram(msg)
+
+def get_active_session(now):
+    hour = now.hour
+    sessions = []
+    if 7 <= hour < 16:  sessions.append("London 🇬🇧")
+    if 12 <= hour < 21: sessions.append("New York 🇺🇸")
+    if 0 <= hour < 9:   sessions.append("Tokyo 🇯🇵")
+    if hour >= 22 or hour < 7: sessions.append("Sydney 🇦🇺")
+    return " + ".join(sessions) if sessions else "Off-hours"
+
+# ─── SESSION ANNOUNCEMENTS ────────────────────────────────
+SESSION_MSGS = {
+    "London_open":   ("🇬🇧 *London Session Open*\n`07:00 UTC` — Prime trading window begins.\nGold and indices most active. Watch for setups.", 7),
+    "NewYork_open":  ("🇺🇸 *New York Session Open*\n`12:00 UTC` — High volatility period.\nBest overlap with London for NAS100 + XAUUSD.", 12),
+    "London_close":  ("🇬🇧 *London Session Closing*\n`16:00 UTC` — Liquidity dropping.\nBe cautious with new entries.", 16),
+    "NewYork_close": ("🇺🇸 *New York Session Closing*\n`21:00 UTC` — Markets winding down.\nAvoid new M1 entries.", 21),
+    "Asian_open":    ("🌏 *Asian Session Active*\n`00:00 UTC` — Lower liquidity.\nGold may drift — wait for London for cleaner setups.", 0),
+}
+
+def check_session_announcements():
+    now  = datetime.now(timezone.utc)
+    hour = now.hour
+    minute = now.minute
+    if minute > 5:
+        return
+    for key, (msg, h) in SESSION_MSGS.items():
+        day_key = f"{key}_{now.date()}"
+        if hour == h and day_key not in announced_sessions:
+            send_telegram(msg)
+            announced_sessions.add(day_key)
+            # Clean old keys
+            if len(announced_sessions) > 20:
+                oldest = list(announced_sessions)[0]
+                announced_sessions.discard(oldest)
+
+# ─── HEARTBEAT (every 20 mins if no signal) ───────────────
+def check_heartbeat():
+    now = datetime.now(timezone.utc)
+    last_hb = stats["last_heartbeat"]
+    last_sig = stats["last_signal_sent"]
+
+    # Check if 20 mins passed since last heartbeat or signal
+    ref_time = last_sig if last_sig else stats["start_time"]
+    if last_hb and (now - last_hb).total_seconds() < 1200:
+        return
+    if (now - ref_time).total_seconds() < 1200:
+        return
+
+    session = get_active_session(now)
+    prices_str = ""
     for inst in INSTRUMENTS:
-        price = get_price(inst)
-        if price and price > 0:
-            price_history[inst["id"]].append(price)
-            if len(price_history[inst["id"]]) > 100:
-                price_history[inst["id"]].pop(0)
+        h = price_history[inst["id"]]
+        if h:
+            prices_str += f"`{inst['id']}: {round(h[-1], inst['decimals'])}` "
 
-        history = price_history[inst["id"]]
-        analysis = analyze(history, inst)
-        sig = analysis["signal"]
-        prev_sig = last_signals[inst["id"]]
+    msg = (
+        f"💓 *Bot Heartbeat*\n"
+        f"`{now.strftime('%H:%M UTC')}` — No signals in last 20 mins\n"
+        f"Session: `{session}`\n"
+        f"Prices: {prices_str}\n"
+        f"_Monitoring continues..._"
+    )
+    send_telegram(msg)
+    stats["last_heartbeat"] = now
 
-        log.info(f"{inst['id']} | Price: {price} | Signal: {sig} | {analysis.get('reason','')}")
+# ─── FORMAT SIGNAL MESSAGE ────────────────────────────────
+def format_signal(inst, analysis):
+    now = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    sig = analysis["signal"]
+    emoji = "🟢" if sig == "BUY" else "🔴"
+    rating = analysis.get("rating", "MID ⚡")
 
-        # Only notify on NEW signal (not repeat WAITs)
-        if sig != "WAIT" and sig != prev_sig:
-            last_signals[inst["id"]] = sig
-            msg = format_signal_message(inst, analysis, price)
-            if msg:
-                send_telegram(msg)
-                log.info(f"Signal sent to Telegram: {inst['id']} {sig}")
-
-        elif sig == "WAIT" and prev_sig in ("BUY", "SELL"):
-            # Signal cleared — optionally notify
-            last_signals[inst["id"]] = "WAIT"
-            send_telegram(f"⏸ *{inst['id']}* signal cleared — `WAIT`")
-
-def main():
-    log.info("═══════════════════════════════════")
-    log.info("  SMC Signal Bot — Starting up")
-    log.info(f"  Instruments: {[i['id'] for i in INSTRUMENTS]}")
-    log.info(f"  Scan interval: {SCAN_INTERVAL}s")
-    log.info(f"  TwelveData: {'✓ configured' if TWELVEDATA_API_KEY else '✗ using fallback APIs'}")
-    log.info(f"  Telegram: {'✓ configured' if TELEGRAM_TOKEN else '✗ NOT configured'}")
-    log.info("═══════════════════════════════════")
-
-    # Send startup message
-    send_telegram(
-        "✅ *SMC Signal Bot Online*\n"
-        f"Monitoring: `XAUUSD | NAS100 | USOUSD | EURUSD`\n"
-        f"Scan every `{SCAN_INTERVAL}s`\n"
-        "_Signals will appear here automatically._"
+    return (
+        f"{emoji} *{sig} — {inst['id']}* ({inst['label']})\n"
+        f"⭐ Rating: *{rating}*\n"
+        f"⏰ `{now}`\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"📍 Entry:  `{analysis['entry']}`\n"
+        f"🛑 SL:     `{analysis['sl']}`\n"
+        f"🎯 TP1:    `{analysis['tp1']}`\n"
+        f"🎯 TP2:    `{analysis['tp2']}`\n"
+        f"📊 RR:     `{analysis['rr']}`\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"🧠 _{analysis['reason']}_\n"
+        f"📈 Structure: `{analysis.get('structure','N/A')}`\n"
+        f"⚠️ _Confirm on chart before trading_"
     )
 
+# ─── MAIN SCAN ────────────────────────────────────────────
+def scan():
+    stats["last_scan"] = datetime.now(timezone.utc)
+    for inst in INSTRUMENTS:
+        try:
+            price = get_price(inst)
+            if price and price > 0:
+                price_history[inst["id"]].append(price)
+                if len(price_history[inst["id"]]) > 150:
+                    price_history[inst["id"]].pop(0)
+
+            analysis = analyze(price_history[inst["id"]], inst)
+            sig      = analysis["signal"]
+            prev_sig = last_signals[inst["id"]]
+
+            log.info(f"{inst['id']} | {price} | {sig} | {analysis.get('reason','')}")
+
+            if sig != "WAIT" and sig != prev_sig:
+                last_signals[inst["id"]]    = sig
+                last_signal_time[inst["id"]]= datetime.now(timezone.utc)
+                msg = format_signal(inst, analysis)
+                send_telegram(msg)
+                stats["signals_today"] += 1
+                stats["last_signal_sent"] = datetime.now(timezone.utc)
+                stats["last_heartbeat"]   = datetime.now(timezone.utc)
+
+            elif sig == "WAIT" and prev_sig in ("BUY", "SELL"):
+                last_signals[inst["id"]] = "WAIT"
+                send_telegram(f"⏸ *{inst['id']}* signal cleared — now `WAIT`")
+
+        except Exception as e:
+            log.error(f"Error scanning {inst['id']}: {e}")
+
+# ─── RESET DAILY STATS ────────────────────────────────────
+last_reset_day = None
+def reset_daily_stats():
+    global last_reset_day
+    today = datetime.now(timezone.utc).date()
+    if last_reset_day != today:
+        stats["signals_today"] = 0
+        last_reset_day = today
+        announced_sessions.clear()
+
+# ─── MAIN ─────────────────────────────────────────────────
+def main():
+    log.info("SMC Signal Bot v2 — Starting")
+    send_telegram(
+        "✅ *SMC Signal Bot v2 Online*\n"
+        f"📊 Monitoring: `XAUUSD | NAS100 | EURUSD | USOUSD`\n"
+        f"🔄 Scan every: `{SCAN_INTERVAL}s`\n"
+        f"⭐ Signal ratings: `STRONG 🔥 / MID ⚡`\n"
+        f"💓 Heartbeat: every `20 mins` if no signal\n"
+        f"📡 Send `status` anytime for live update\n"
+        f"_Signals will appear here automatically._"
+    )
+    tick = 0
     while True:
         try:
+            reset_daily_stats()
             scan()
+            check_session_announcements()
+            check_heartbeat()
+            if tick % 5 == 0:
+                check_telegram_commands()
+            tick += 1
         except Exception as e:
-            log.error(f"Scan error: {e}")
+            log.error(f"Main loop error: {e}")
         time.sleep(SCAN_INTERVAL)
 
 if __name__ == "__main__":
     main()
-
