@@ -23,10 +23,14 @@ USE_WEBSOCKET      = os.environ.get("USE_WEBSOCKET", "true").lower() == "true"
 
 # ─── INSTRUMENTS (PU Prime Islamic Standard) ──────────────
 INSTRUMENTS = [
-    {"id": "XAUUSD", "label": "Gold",    "symbol": "XAU/USD",  "decimals": 2,  "sl_dist": 3.5,   "priority": 1, "ws": True},
-    {"id": "NAS100", "label": "Nasdaq",  "symbol": "NDX",      "decimals": 1,  "sl_dist": 20.0,  "priority": 2, "ws": False},
-    {"id": "EURUSD", "label": "EUR/USD", "symbol": "EUR/USD",  "decimals": 5,  "sl_dist": 0.0015,"priority": 3, "ws": True},
-    {"id": "USOUSD", "label": "WTI Oil", "symbol": "USO",      "decimals": 2,  "sl_dist": 0.8,   "priority": 4, "ws": False},
+    {"id": "XAUUSD", "label": "Gold",    "symbol": "XAU/USD",  "decimals": 2,  "sl_dist": 3.5,   "priority": 1, "ws": True,
+     "lot_strong": 0.05, "lot_mid": 0.02, "valid_min": 1000,  "valid_max": 10000},
+    {"id": "NAS100", "label": "Nasdaq",  "symbol": "US100",    "decimals": 1,  "sl_dist": 20.0,  "priority": 2, "ws": False,
+     "lot_strong": 0.2,  "lot_mid": 0.1,  "valid_min": 10000, "valid_max": 40000, "multiplier": 1000},
+    {"id": "EURUSD", "label": "EUR/USD", "symbol": "EUR/USD",  "decimals": 5,  "sl_dist": 0.0015,"priority": 3, "ws": True,
+     "lot_strong": 0.03, "lot_mid": 0.02, "valid_min": 0.5,   "valid_max": 2.0},
+    {"id": "USOUSD", "label": "WTI Oil", "symbol": "WTI/USD",  "decimals": 2,  "sl_dist": 0.8,   "priority": 4, "ws": False,
+     "lot_strong": 0.03, "lot_mid": 0.02, "valid_min": 30,    "valid_max": 130},
 ]
 SYMBOL_TO_ID = {i["symbol"]: i["id"] for i in INSTRUMENTS}
 
@@ -83,7 +87,16 @@ def on_ws_message(ws, message):
             price  = data.get("price")
             if symbol in SYMBOL_TO_ID and price:
                 inst_id = SYMBOL_TO_ID[symbol]
-                latest_price[inst_id] = float(price)
+                inst_obj = next((i for i in INSTRUMENTS if i["id"] == inst_id), None)
+                fp = float(price)
+                # sanity check
+                if inst_obj:
+                    vmin = inst_obj.get("valid_min", 0)
+                    vmax = inst_obj.get("valid_max", 999999)
+                    if vmin <= fp <= vmax:
+                        latest_price[inst_id] = fp
+                else:
+                    latest_price[inst_id] = fp
         elif data.get("event") == "subscribe-status":
             log.info(f"WS subscribe status: {data.get('status')}")
     except Exception as e:
@@ -128,17 +141,39 @@ def run_websocket():
         log.info("Reconnecting WebSocket in 5s...")
         time.sleep(5)
 
+def price_is_valid(inst, price):
+    """Sanity check — reject obviously wrong prices."""
+    if price is None:
+        return False
+    vmin = inst.get("valid_min", 0)
+    vmax = inst.get("valid_max", 999999)
+    if price < vmin or price > vmax:
+        log.warning(f"{inst['id']} price {price} OUTSIDE valid range [{vmin}-{vmax}] — rejecting")
+        return False
+    return True
+
 def rest_poll_loop():
     """Poll REST prices for non-WebSocket instruments (NAS100, USOUSD)."""
     while True:
         for inst in INSTRUMENTS:
             if inst.get("ws"):
-                continue  # handled by WebSocket
+                continue
             if inst["id"] in paused_markets:
                 continue
             price = fetch_twelvedata(inst["symbol"])
-            if price:
+            if price is not None and inst.get("multiplier"):
+                price = price * inst["multiplier"]
+            if price_is_valid(inst, price):
                 latest_price[inst["id"]] = price
+            elif price is not None:
+                # Wrong data — alert once and skip
+                if not feed_alerted.get(inst["id"]):
+                    feed_alerted[inst["id"]] = True
+                    send_telegram(
+                        f"⚠️ *{inst['id']} Data Warning*\n"
+                        f"Received price `{price}` which is outside expected range.\n"
+                        f"Signals for {inst['id']} paused until valid data returns."
+                    )
         time.sleep(8)
 
 # ─── CHART PATTERN DETECTION ──────────────────────────────
@@ -281,13 +316,27 @@ def analyze(prices, inst):
         "retest": (demand_retest if direction=="BUY" else supply_retest),
         "struct_aligned": struct_aligned,
     }
+    # ── Entry confirmation: require reaction candle in signal direction ──
+    # Last price move must confirm the direction (not just pattern)
+    confirm_candle = False
+    if direction == "BUY" and prices[-1] > prices[-2]:
+        confirm_candle = True  # bullish reaction
+    elif direction == "SELL" and prices[-1] < prices[-2]:
+        confirm_candle = True  # bearish reaction
+    factors["confirm_candle"] = confirm_candle
+
     rating = rate_signal(factors)
     if not rating:
         return {"signal": "WAIT", "reason": "Setup too weak — skipping"}
 
-    tp1_mult, tp2_mult = 2.0, 3.5
+    # Require confirmation candle for entry (improves win rate in ranging markets)
+    if not confirm_candle:
+        return {"signal": "WAIT", "reason": "Awaiting reaction candle confirmation"}
+
+    # Tighter, more achievable targets for M1 scalping
+    tp1_mult, tp2_mult = 1.0, 1.8
     if "STRONG" in rating:
-        tp2_mult = 4.5
+        tp2_mult = 2.2  # let strong signals run a bit further
 
     if direction == "BUY":
         return {"signal": "BUY", "rating": rating, "entry": round(last, dec),
@@ -301,9 +350,9 @@ def analyze(prices, inst):
                 "reason": " + ".join(reasons), "structure": structure}
 
 # ─── LOT SIZE + PROFIT ────────────────────────────────────
-def get_lot_recommendation(rating):
-    if "STRONG" in rating: return 0.03
-    elif "MID" in rating:  return 0.02
+def get_lot_recommendation(rating, inst):
+    if "STRONG" in rating: return inst.get("lot_strong", 0.03)
+    elif "MID" in rating:  return inst.get("lot_mid", 0.02)
     return 0.01
 
 def estimate_profit(inst_id, entry, tp1, tp2, sl, lots):
@@ -311,8 +360,10 @@ def estimate_profit(inst_id, entry, tp1, tp2, sl, lots):
         d_tp1 = abs(float(tp1) - float(entry))
         d_tp2 = abs(float(tp2) - float(entry))
         d_sl  = abs(float(sl)  - float(entry))
-        if inst_id in ("XAUUSD", "NAS100"):
-            pv = 100 * lots
+        if inst_id == "XAUUSD":
+            pv = 100 * lots          # $1 per $1 move per 0.01 lot
+        elif inst_id == "NAS100":
+            pv = 1 * lots            # PU Prime: $1 per point per 1.0 lot
         elif inst_id == "USOUSD":
             pv = 1000 * lots
         elif inst_id == "EURUSD":
@@ -327,7 +378,7 @@ def format_signal(inst, a):
     now = datetime.now(timezone.utc).strftime("%H:%M UTC")
     emoji = "🟢" if a["signal"] == "BUY" else "🔴"
     rating = a.get("rating", "MID ⚡")
-    lots = get_lot_recommendation(rating)
+    lots = get_lot_recommendation(rating, inst)
     p1, p2, ls = estimate_profit(inst["id"], a["entry"], a["tp1"], a["tp2"], a["sl"], lots)
     return (
         f"{emoji} *{a['signal']} — {inst['id']}* ({inst['label']})\n"
@@ -350,6 +401,9 @@ def format_signal(inst, a):
         f"━━━━━━━━━━━━━━\n"
         f"Copy TP1: `{a['tp1']}`\n"
         f"Copy TP2: `{a['tp2']}`\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"💡 _Tip: Move SL to breakeven after TP1 hits._\n"
+        f"⚡ _XAUUSD can spike during session opens & news — confirm momentum before entry._\n"
         f"⚠️ _Confirm on chart before trading_"
     )
 
