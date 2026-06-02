@@ -23,10 +23,10 @@ USE_WEBSOCKET      = os.environ.get("USE_WEBSOCKET", "true").lower() == "true"
 
 # ─── INSTRUMENTS (PU Prime Islamic Standard) ──────────────
 INSTRUMENTS = [
-    {"id": "XAUUSD", "label": "Gold",    "symbol": "XAU/USD",  "decimals": 2,  "sl_dist": 3.5,   "priority": 1},
-    {"id": "NAS100", "label": "Nasdaq",  "symbol": "NDX",      "decimals": 1,  "sl_dist": 20.0,  "priority": 2},
-    {"id": "EURUSD", "label": "EUR/USD", "symbol": "EUR/USD",  "decimals": 5,  "sl_dist": 0.0015,"priority": 3},
-    {"id": "USOUSD", "label": "WTI Oil", "symbol": "USO",      "decimals": 2,  "sl_dist": 0.8,   "priority": 4},
+    {"id": "XAUUSD", "label": "Gold",    "symbol": "XAU/USD",  "decimals": 2,  "sl_dist": 3.5,   "priority": 1, "ws": True},
+    {"id": "NAS100", "label": "Nasdaq",  "symbol": "NDX",      "decimals": 1,  "sl_dist": 20.0,  "priority": 2, "ws": False},
+    {"id": "EURUSD", "label": "EUR/USD", "symbol": "EUR/USD",  "decimals": 5,  "sl_dist": 0.0015,"priority": 3, "ws": True},
+    {"id": "USOUSD", "label": "WTI Oil", "symbol": "USO",      "decimals": 2,  "sl_dist": 0.8,   "priority": 4, "ws": False},
 ]
 SYMBOL_TO_ID = {i["symbol"]: i["id"] for i in INSTRUMENTS}
 
@@ -100,10 +100,11 @@ def on_ws_close(ws, code, msg):
 def on_ws_open(ws):
     log.info("WebSocket connected")
     stats["ws_connected"] = True
-    symbols = ",".join(i["symbol"] for i in INSTRUMENTS)
+    # Only subscribe to WebSocket-supported instruments
+    symbols = ",".join(i["symbol"] for i in INSTRUMENTS if i.get("ws"))
     sub = {"action": "subscribe", "params": {"symbols": symbols}}
     ws.send(json.dumps(sub))
-    log.info(f"Subscribed to: {symbols}")
+    log.info(f"WS Subscribed to: {symbols}")
 
 def run_websocket():
     """Run TwelveData WebSocket connection with auto-reconnect."""
@@ -128,15 +129,17 @@ def run_websocket():
         time.sleep(5)
 
 def rest_poll_loop():
-    """Fallback REST polling if WebSocket unavailable."""
+    """Poll REST prices for non-WebSocket instruments (NAS100, USOUSD)."""
     while True:
         for inst in INSTRUMENTS:
+            if inst.get("ws"):
+                continue  # handled by WebSocket
             if inst["id"] in paused_markets:
                 continue
             price = fetch_twelvedata(inst["symbol"])
             if price:
                 latest_price[inst["id"]] = price
-        time.sleep(10)
+        time.sleep(8)
 
 # ─── CHART PATTERN DETECTION ──────────────────────────────
 def detect_pattern(prices):
@@ -528,11 +531,11 @@ def analysis_loop():
 # ─── MAIN ─────────────────────────────────────────────────
 def main():
     log.info("SMC Signal Bot v3 (WebSocket) — Starting")
-    feed_type = "WebSocket (real-time)" if (USE_WEBSOCKET and websocket) else "REST polling"
     send_telegram(
         "✅ *SMC Signal Bot v3 Online*\n"
         f"📊 Monitoring: `XAUUSD | NAS100 | EURUSD | USOUSD`\n"
-        f"📡 Feed: `{feed_type}`\n"
+        f"📡 XAUUSD + EURUSD: `WebSocket (real-time)`\n"
+        f"📡 NAS100 + USOUSD: `REST (8s)`\n"
         f"⚡ Analysis every: `{ANALYZE_INTERVAL}s`\n"
         f"⭐ Ratings: `STRONG 🔥 / MID ⚡`\n"
         f"💓 Heartbeat: every `20 mins` if no signal\n"
@@ -540,15 +543,16 @@ def main():
         f"_Signals appear here automatically._"
     )
 
-    # Start price feed thread
+    # Start WebSocket thread for XAUUSD + EURUSD (real-time)
     if USE_WEBSOCKET and websocket:
-        t = threading.Thread(target=run_websocket, daemon=True)
-        t.start()
-        log.info("WebSocket thread started")
-    else:
-        t = threading.Thread(target=rest_poll_loop, daemon=True)
-        t.start()
-        log.info("REST polling thread started")
+        t_ws = threading.Thread(target=run_websocket, daemon=True)
+        t_ws.start()
+        log.info("WebSocket thread started (XAUUSD, EURUSD)")
+
+    # Always start REST thread for NAS100 + USOUSD
+    t_rest = threading.Thread(target=rest_poll_loop, daemon=True)
+    t_rest.start()
+    log.info("REST polling thread started (NAS100, USOUSD)")
 
     # Give feed a moment to populate
     time.sleep(3)
