@@ -11,14 +11,14 @@ log = logging.getLogger(__name__)
 TELEGRAM_TOKEN     = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "")
-SCAN_INTERVAL      = int(os.environ.get("SCAN_INTERVAL", "60"))
+SCAN_INTERVAL      = int(os.environ.get("SCAN_INTERVAL", "30"))
 
 # ─── INSTRUMENTS (PU Prime Islamic Standard) ──────────────
 INSTRUMENTS = [
-    {"id": "XAUUSD", "label": "Gold",    "symbol": "XAU/USD", "decimals": 2,  "sl_dist": 3.5,   "td": True,  "priority": 1},
-    {"id": "NAS100", "label": "Nasdaq",  "symbol": None,      "decimals": 1,  "sl_dist": 20.0,  "td": False, "priority": 2},
-    {"id": "EURUSD", "label": "EUR/USD", "symbol": "EUR/USD", "decimals": 5,  "sl_dist": 0.0015,"td": True,  "priority": 3},
-    {"id": "USOUSD", "label": "WTI Oil", "symbol": None,      "decimals": 2,  "sl_dist": 0.8,   "td": False, "priority": 4},
+    {"id": "XAUUSD", "label": "Gold",    "symbol": "XAU/USD",  "decimals": 2,  "sl_dist": 3.5,   "td": True, "priority": 1},
+    {"id": "NAS100", "label": "Nasdaq",  "symbol": "IXIC",     "decimals": 1,  "sl_dist": 20.0,  "td": True, "priority": 2},
+    {"id": "EURUSD", "label": "EUR/USD", "symbol": "EUR/USD",  "decimals": 5,  "sl_dist": 0.0015,"td": True, "priority": 3},
+    {"id": "USOUSD", "label": "WTI Oil", "symbol": "WTI/USD",  "decimals": 2,  "sl_dist": 0.8,   "td": True, "priority": 4},
 ]
 
 # ─── STATE ────────────────────────────────────────────────
@@ -71,19 +71,32 @@ def fetch_frankfurter():
     except:
         return None
 
+# Track data feed failures
+feed_failures = {i["id"]: 0 for i in INSTRUMENTS}
+feed_alerted  = {i["id"]: False for i in INSTRUMENTS}
+
 def get_price(inst):
-    if TWELVEDATA_API_KEY and inst.get("td") and inst.get("symbol"):
-        p = fetch_twelvedata(inst["symbol"])
-        if p: return p
-    if inst["id"] == "XAUUSD":
-        return fetch_yahoo("GC%3DF")
-    elif inst["id"] == "NAS100":
-        return fetch_yahoo("%5EIXIC")
-    elif inst["id"] == "USOUSD":
-        return fetch_yahoo("CL%3DF")
-    elif inst["id"] == "EURUSD":
-        return fetch_frankfurter()
-    return None
+    """Fetch price from TwelveData only — no stale fallbacks."""
+    if not TWELVEDATA_API_KEY:
+        log.warning("No TwelveData API key configured")
+        return None
+    price = fetch_twelvedata(inst["symbol"])
+    if price:
+        feed_failures[inst["id"]] = 0
+        if feed_alerted[inst["id"]]:
+            feed_alerted[inst["id"]] = False
+            send_telegram(f"✅ *{inst['id']}* data feed restored.")
+        return price
+    else:
+        feed_failures[inst["id"]] += 1
+        if feed_failures[inst["id"]] >= 3 and not feed_alerted[inst["id"]]:
+            feed_alerted[inst["id"]] = True
+            send_telegram(
+                f"⚠️ *Data Feed Issue — {inst['id']}*\n"
+                f"TwelveData not returning prices.\n"
+                f"Check your API key or plan limits."
+            )
+        return None
 
 # ─── CHART PATTERN DETECTION ──────────────────────────────
 def detect_pattern(prices):
@@ -355,6 +368,7 @@ def send_telegram(text, parse_mode="Markdown"):
         log.error(f"Telegram error: {e}")
 
 last_update_id = 0
+paused_markets = set()  # instruments currently paused by user
 
 def check_telegram_commands():
     """Poll Telegram for commands every scan."""
@@ -372,9 +386,48 @@ def check_telegram_commands():
                 send_telegram(
                     "📋 *SMC Bot Commands*\n\n"
                     "`status` — Live bot status\n"
+                    "`markets` — Show active/paused markets\n"
+                    "`pause XAUUSD` — Pause Gold signals\n"
+                    "`pause NAS100` — Pause Nasdaq signals\n"
+                    "`pause EURUSD` — Pause EUR/USD signals\n"
+                    "`pause USOUSD` — Pause Oil signals\n"
+                    "`pause all` — Pause all markets\n"
+                    "`resume XAUUSD` — Resume Gold signals\n"
+                    "`resume all` — Resume all markets\n"
                     "`help` — Show this menu\n\n"
                     "_Signals are sent automatically._"
                 )
+            elif msg.startswith("pause"):
+                parts = msg.split()
+                target = parts[1].upper() if len(parts) > 1 else "ALL"
+                if target == "ALL":
+                    for i in INSTRUMENTS:
+                        paused_markets.add(i["id"])
+                    send_telegram("⏸ *All markets paused.*\nSend `resume all` to restart.")
+                else:
+                    valid = [i["id"] for i in INSTRUMENTS]
+                    if target in valid:
+                        paused_markets.add(target)
+                        send_telegram(f"⏸ *{target}* signals paused.\nSend `resume {target}` to restart.")
+                    else:
+                        send_telegram(f"❓ Unknown market: `{target}`\nValid: `XAUUSD NAS100 EURUSD USOUSD`")
+            elif msg.startswith("resume"):
+                parts = msg.split()
+                target = parts[1].upper() if len(parts) > 1 else "ALL"
+                if target == "ALL":
+                    paused_markets.clear()
+                    send_telegram("▶️ *All markets resumed.*")
+                else:
+                    paused_markets.discard(target)
+                    send_telegram(f"▶️ *{target}* signals resumed.")
+            elif msg in ("/markets", "markets"):
+                lines = []
+                for i in INSTRUMENTS:
+                    status = "⏸ PAUSED" if i["id"] in paused_markets else "✅ Active"
+                    h = price_history[i["id"]]
+                    price = round(h[-1], i["decimals"]) if h else "N/A"
+                    lines.append(f"{status} — `{i['id']}` @ `{price}`")
+                send_telegram("📊 *Market Status*\n\n" + "\n".join(lines))
     except Exception as e:
         log.warning(f"Command check error: {e}")
 
@@ -468,6 +521,51 @@ def check_heartbeat():
     send_telegram(msg)
     stats["last_heartbeat"] = now
 
+
+# ─── LOT SIZE + PROFIT ESTIMATE ───────────────────────────
+def get_lot_recommendation(rating, inst_id):
+    """Recommend lot size based on signal strength."""
+    if "STRONG" in rating:
+        lots = 0.03
+    elif "MID" in rating:
+        lots = 0.02
+    else:
+        lots = 0.01
+    return lots
+
+def estimate_profit(inst_id, entry, tp1, tp2, sl, lots):
+    """Estimate profit at TP1/TP2 and loss if SL hits."""
+    try:
+        dist_tp1 = abs(float(tp1) - float(entry))
+        dist_tp2 = abs(float(tp2) - float(entry))
+        dist_sl  = abs(float(sl)  - float(entry))
+
+        if inst_id == "XAUUSD":
+            pip_val      = 100 * lots
+            profit_tp1   = round(dist_tp1 * pip_val, 2)
+            profit_tp2   = round(dist_tp2 * pip_val, 2)
+            loss_sl      = round(dist_sl  * pip_val, 2)
+        elif inst_id == "NAS100":
+            pip_val      = 100 * lots
+            profit_tp1   = round(dist_tp1 * pip_val, 2)
+            profit_tp2   = round(dist_tp2 * pip_val, 2)
+            loss_sl      = round(dist_sl  * pip_val, 2)
+        elif inst_id == "EURUSD":
+            profit_tp1   = round(100000 * lots * dist_tp1, 2)
+            profit_tp2   = round(100000 * lots * dist_tp2, 2)
+            loss_sl      = round(100000 * lots * dist_sl,  2)
+        elif inst_id == "USOUSD":
+            pip_val      = 1000 * lots
+            profit_tp1   = round(dist_tp1 * pip_val, 2)
+            profit_tp2   = round(dist_tp2 * pip_val, 2)
+            loss_sl      = round(dist_sl  * pip_val, 2)
+        else:
+            profit_tp1 = profit_tp2 = loss_sl = 0.0
+
+        return profit_tp1, profit_tp2, loss_sl
+    except:
+        return 0.0, 0.0, 0.0
+
 # ─── FORMAT SIGNAL MESSAGE ────────────────────────────────
 def format_signal(inst, analysis):
     now = datetime.now(timezone.utc).strftime("%H:%M UTC")
@@ -475,19 +573,33 @@ def format_signal(inst, analysis):
     emoji = "🟢" if sig == "BUY" else "🔴"
     rating = analysis.get("rating", "MID ⚡")
 
+    rating = analysis.get("rating", "MID ⚡")
+    lots = get_lot_recommendation(rating, inst["id"])
+    profit_tp1, profit_tp2, loss_sl = estimate_profit(
+        inst["id"], analysis["entry"], analysis["tp1"], analysis["tp2"], analysis["sl"], lots
+    )
+
     return (
         f"{emoji} *{sig} — {inst['id']}* ({inst['label']})\n"
         f"⭐ Rating: *{rating}*\n"
         f"⏰ `{now}`\n"
         f"━━━━━━━━━━━━━━\n"
-        f"📍 Entry:  `{analysis['entry']}`\n"
+        f"📍 Entry:  *{analysis['entry']}*\n"
         f"🛑 SL:     `{analysis['sl']}`\n"
         f"🎯 TP1:    `{analysis['tp1']}`\n"
         f"🎯 TP2:    `{analysis['tp2']}`\n"
         f"📊 RR:     `{analysis['rr']}`\n"
         f"━━━━━━━━━━━━━━\n"
+        f"💼 Lot Size:  *{lots}*\n"
+        f"💰 Est. Profit TP1: *~${profit_tp1}*\n"
+        f"💰 Est. Profit TP2: *~${profit_tp2}*\n"
+        f"🔻 Est. Loss if SL: *~-${loss_sl}*\n"
+        f"━━━━━━━━━━━━━━\n"
         f"🧠 _{analysis['reason']}_\n"
         f"📈 Structure: `{analysis.get('structure','N/A')}`\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"Copy TP1: `{analysis['tp1']}`\n"
+        f"Copy TP2: `{analysis['tp2']}`\n"
         f"⚠️ _Confirm on chart before trading_"
     )
 
@@ -496,6 +608,9 @@ def scan():
     stats["last_scan"] = datetime.now(timezone.utc)
     for inst in INSTRUMENTS:
         try:
+            if inst["id"] in paused_markets:
+                log.info(f"{inst['id']} | PAUSED — skipping")
+                continue
             price = get_price(inst)
             if price and price > 0:
                 price_history[inst["id"]].append(price)
