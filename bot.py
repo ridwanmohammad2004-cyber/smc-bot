@@ -354,18 +354,29 @@ def send_telegram(text, parse_mode="Markdown"):
     except Exception as e:
         log.error(f"Telegram error: {e}")
 
+last_update_id = 0
+
 def check_telegram_commands():
-    """Poll Telegram for /status command."""
+    """Poll Telegram for commands every scan."""
+    global last_update_id
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?timeout=1&offset=-1"
-        r = requests.get(url, timeout=5)
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?timeout=1&offset={last_update_id + 1}&limit=10"
+        r = requests.get(url, timeout=6)
         updates = r.json().get("result", [])
         for u in updates:
+            last_update_id = u.get("update_id", last_update_id)
             msg = u.get("message", {}).get("text", "").strip().lower()
             if msg in ("/status", "status"):
                 send_status()
-    except:
-        pass
+            elif msg in ("/help", "help"):
+                send_telegram(
+                    "📋 *SMC Bot Commands*\n\n"
+                    "`status` — Live bot status\n"
+                    "`help` — Show this menu\n\n"
+                    "_Signals are sent automatically._"
+                )
+    except Exception as e:
+        log.warning(f"Command check error: {e}")
 
 def send_status():
     now = datetime.now(timezone.utc)
@@ -542,8 +553,7 @@ def main():
             scan()
             check_session_announcements()
             check_heartbeat()
-            if tick % 5 == 0:
-                check_telegram_commands()
+            check_telegram_commands()
             tick += 1
         except Exception as e:
             log.error(f"Main loop error: {e}")
