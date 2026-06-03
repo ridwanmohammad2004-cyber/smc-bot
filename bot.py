@@ -193,99 +193,128 @@ def calculate_lot_size(sl_dist_points, inst_id):
         log.error(f"Lot calculation error: {e}")
         return FALLBACK_LOT
 
-def place_auto_trade(inst, analysis):
-    """Place a trade via MetaAPI. Returns trade_id or None."""
-    if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID:
-        log.warning("MetaAPI credentials missing — cannot auto-trade")
-        return None
-
-    # ── SAFETY FEATURE 2: Max open positions guard ──
-    open_count = len(auto_trades)
-    if open_count >= MAX_OPEN_POSITIONS:
-        log.info(f"Max positions ({MAX_OPEN_POSITIONS}) reached — skipping auto-trade")
-        send_telegram(
-            f"⏸ *Auto-trade skipped — {inst['id']}*\n"
-            f"Already have {open_count} open position(s).\n"
-            f"Max allowed: `{MAX_OPEN_POSITIONS}`\n"
-            f"_Signal still valid — place manually if desired._"
-        )
-        return None
-
-    # ── SAFETY FEATURE 1: Kill-switch check ──
-    if stats.get("kill_switch_active"):
-        log.info("Kill-switch active — auto-trading disabled for today")
-        return None
-
+def place_single_order(mt5_symbol, action, lot, sl, tp, label):
+    """Place one MT5 order via MetaAPI. Returns trade_id or None."""
     try:
-        direction = analysis["signal"]
-        entry     = analysis["entry"]
-        sl        = analysis["sl"]
-        sl_dist   = inst["sl_dist"]
-        dec       = inst["decimals"]
-
-        # ── SAFETY FEATURE 1: Dynamic lot sizing ──
-        lot = calculate_lot_size(sl_dist, inst["id"])
-
-        # 3-target TP structure
-        if direction == "BUY":
-            tp1 = round(entry + sl_dist * AUTO_TP1_MULT, dec)
-            tp2 = round(entry + sl_dist * AUTO_TP2_MULT, dec)
-            tp3 = round(entry + sl_dist * AUTO_TP3_MULT, dec)
-            action = "ORDER_TYPE_BUY"
-        else:
-            tp1 = round(entry - sl_dist * AUTO_TP1_MULT, dec)
-            tp2 = round(entry - sl_dist * AUTO_TP2_MULT, dec)
-            tp3 = round(entry - sl_dist * AUTO_TP3_MULT, dec)
-            action = "ORDER_TYPE_SELL"
-
-        mt5_symbol = get_metaapi_symbol(inst["id"])
-
         payload = {
             "symbol":     mt5_symbol,
             "actionType": action,
             "volume":     lot,
             "stopLoss":   sl,
-            "takeProfit": tp1,
-            "comment":    "SMC-Bot-Auto"
+            "takeProfit": tp,
+            "comment":    f"SMC-{label}"
         }
-
         url = f"{META_API_URL}/users/current/accounts/{METAAPI_ACCOUNT_ID}/trade"
-        r = requests.post(url, headers=metaapi_headers(), json=payload, timeout=15)
+        r   = requests.post(url, headers=metaapi_headers(), json=payload, timeout=15)
         data = r.json()
-
-        log.info(f"MetaAPI response: {data}")
-
-        # Extract trade/order ID
+        log.info(f"MetaAPI [{label}] response: {data}")
         trade_id = (
             data.get("orderId") or
             data.get("positionId") or
             data.get("tradeExecutionId") or
-            str(int(time.time()))
+            f"{label}_{int(time.time())}"
         )
-
-        # Store auto-trade state
-        auto_trades[trade_id] = {
-            "inst_id":   inst["id"],
-            "label":     inst["label"],
-            "direction": direction,
-            "entry":     entry,
-            "sl":        sl,
-            "sl_dist":   sl_dist,
-            "tp1":       tp1,
-            "tp2":       tp2,
-            "tp3":       tp3,
-            "tp1_hit":   False,
-            "tp2_hit":   False,
-            "sl_moved":  False,
-            "lots":      lot,
-            "opened_at": datetime.now(timezone.utc).strftime("%H:%M UTC"),
-            "status":    "OPEN",
-        }
-
         return trade_id
+    except Exception as e:
+        log.error(f"MetaAPI order error [{label}]: {e}")
+        return None
+
+def place_auto_trade(inst, analysis):
+    """
+    Place 3 separate MT5 positions for one STRONG signal.
+    Position 1 → TP1 (50% of lot)
+    Position 2 → TP2 (30% of lot)
+    Position 3 → TP3 (20% of lot, runner)
+    All 3 share the same SL.
+    Returns True if at least 1 position placed, else None.
+    """
+    if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID:
+        log.warning("MetaAPI credentials missing — cannot auto-trade")
+        return None
+
+    # ── SAFETY: Kill-switch check ──
+    if stats.get("kill_switch_active"):
+        log.info("Kill-switch active — auto-trading disabled for today")
+        return None
+
+    # ── SAFETY: Max open positions guard ──
+    # Count unique signals (groups of 3), not individual positions
+    active_signals = set(t.get("signal_group") for t in auto_trades.values())
+    if len(active_signals) >= MAX_OPEN_POSITIONS:
+        log.info(f"Max open signals ({MAX_OPEN_POSITIONS}) reached — skipping")
+        send_telegram(
+            f"⏸ *Auto-trade skipped — {inst['id']}*\n"
+            f"Already have {len(active_signals)} active signal(s).\n"
+            f"Max allowed: `{MAX_OPEN_POSITIONS}`\n"
+            f"_Signal still valid — place manually if desired._"
+        )
+        return None
+
+    try:
+        direction  = analysis["signal"]
+        entry      = analysis["entry"]
+        sl         = analysis["sl"]
+        sl_dist    = inst["sl_dist"]
+        dec        = inst["decimals"]
+        mt5_symbol = get_metaapi_symbol(inst["id"])
+        action     = "ORDER_TYPE_BUY" if direction == "BUY" else "ORDER_TYPE_SELL"
+        now_str    = datetime.now(timezone.utc).strftime("%H:%M UTC")
+        signal_group = f"{inst['id']}_{int(time.time())}"
+
+        # ── TP levels ──
+        if direction == "BUY":
+            tp1 = round(entry + sl_dist * AUTO_TP1_MULT, dec)
+            tp2 = round(entry + sl_dist * AUTO_TP2_MULT, dec)
+            tp3 = round(entry + sl_dist * AUTO_TP3_MULT, dec)
+        else:
+            tp1 = round(entry - sl_dist * AUTO_TP1_MULT, dec)
+            tp2 = round(entry - sl_dist * AUTO_TP2_MULT, dec)
+            tp3 = round(entry - sl_dist * AUTO_TP3_MULT, dec)
+
+        # ── Dynamic lot sizing — total then split ──
+        total_lot = calculate_lot_size(sl_dist, inst["id"])
+        # Split: 50% / 30% / 20% — minimum 0.01 each
+        lot1 = max(MIN_LOT, round(total_lot * 0.50, 2))
+        lot2 = max(MIN_LOT, round(total_lot * 0.30, 2))
+        lot3 = max(MIN_LOT, round(total_lot * 0.20, 2))
+
+        # ── Place 3 positions ──
+        placed = []
+        for lot, tp, label in [
+            (lot1, tp1, "TP1"),
+            (lot2, tp2, "TP2"),
+            (lot3, tp3, "TP3"),
+        ]:
+            tid = place_single_order(mt5_symbol, action, lot, sl, tp, label)
+            if tid:
+                auto_trades[tid] = {
+                    "inst_id":      inst["id"],
+                    "label":        inst["label"],
+                    "direction":    direction,
+                    "entry":        entry,
+                    "sl":           sl,
+                    "sl_dist":      sl_dist,
+                    "tp":           tp,
+                    "tp_label":     label,
+                    "sl_moved":     False,
+                    "lots":         lot,
+                    "opened_at":    now_str,
+                    "status":       "OPEN",
+                    "signal_group": signal_group,
+                }
+                placed.append((tid, label, lot, tp))
+                log.info(f"Placed {label} position: id={tid} lot={lot} tp={tp}")
+            time.sleep(0.5)  # small delay between orders
+
+        if not placed:
+            log.error("All 3 positions failed to place")
+            return None
+
+        # Return signal_group so caller can reference all 3
+        return signal_group, placed, tp1, tp2, tp3, lot1, lot2, lot3
 
     except Exception as e:
-        log.error(f"MetaAPI place_trade error: {e}")
+        log.error(f"place_auto_trade error: {e}")
         return None
 
 def close_auto_trade(trade_id, reason="manual"):
@@ -351,128 +380,96 @@ def move_sl_to_breakeven(trade_id):
 
 # ─── AUTO-TRADE MONITOR ───────────────────────────────────
 def monitor_auto_trades(inst, current_price):
-    """Check all open auto-trades for TP/SL/safety hits."""
+    """
+    Each position has its own TP set in MT5.
+    Monitor for: SL hit, safety close, and move SL to BE after TP1 position closes.
+    """
     if not auto_trades:
         return
     dec = inst["decimals"]
     trades_to_close = []
 
-    for trade_id, trade in list(auto_trades.items()):
+    # Group trades by signal_group to track which TPs have closed
+    groups = {}
+    for tid, trade in auto_trades.items():
         if trade["inst_id"] != inst["id"]:
             continue
-        if trade["status"] != "OPEN":
-            continue
+        sg = trade.get("signal_group", tid)
+        groups.setdefault(sg, []).append((tid, trade))
 
-        direction = trade["direction"]
-        entry     = trade["entry"]
-        sl        = trade["sl"]
-        sl_dist   = trade["sl_dist"]
-        tp1       = trade["tp1"]
-        tp2       = trade["tp2"]
-        tp3       = trade["tp3"]
-        price     = current_price
+    for sg, group_trades in groups.items():
+        for trade_id, trade in group_trades:
+            if trade["status"] != "OPEN":
+                continue
 
-        # ── Safety close: within 20% of SL ──
-        if not trade["tp1_hit"]:
+            direction = trade["direction"]
+            entry     = trade["entry"]
+            sl        = trade["sl"]
+            sl_dist   = trade["sl_dist"]
+            tp        = trade["tp"]
+            tp_label  = trade.get("tp_label", "TP")
+            price     = current_price
+
+            # ── Safety close: within 20% of SL ──
             dist_to_sl = abs(price - sl)
-            if dist_to_sl <= sl_dist * SAFETY_CLOSE_PCT:
+            if not trade["sl_moved"] and dist_to_sl <= sl_dist * SAFETY_CLOSE_PCT:
                 send_telegram(
-                    f"⚠️ *SAFETY CLOSE — {trade['inst_id']}*\n"
-                    f"Price `{round(price, dec)}` is dangerously close to SL `{sl}`\n"
-                    f"Auto-closing trade to protect capital.\n"
-                    f"━━━━━━━━━━━━━━\n"
-                    f"_Trade closed before SL hit._"
+                    f"⚠️ *SAFETY CLOSE — {trade['inst_id']} ({tp_label})*\n"
+                    f"Price `{round(price, dec)}` dangerously close to SL `{sl}`\n"
+                    f"Auto-closing to protect capital.\n"
+                    f"_Position closed before SL hit._"
                 )
                 trades_to_close.append((trade_id, "safety_close"))
                 continue
 
-        if direction == "BUY":
-            # SL hit
-            if price <= sl:
-                send_telegram(
-                    f"🔴 *AUTO-TRADE SL HIT — {trade['inst_id']}*\n"
-                    f"Price `{round(price, dec)}` hit SL `{sl}`\n"
-                    f"Entry was `{entry}` | Lots: `{trade['lots']}`\n"
-                    f"━━━━━━━━━━━━━━\n"
-                    f"_Loss taken. Stay disciplined._"
-                )
-                trades_to_close.append((trade_id, "sl_hit"))
-            # TP1
-            elif not trade["tp1_hit"] and price >= tp1:
-                trade["tp1_hit"] = True
-                move_sl_to_breakeven(trade_id)
-                send_telegram(
-                    f"✅ *AUTO-TRADE TP1 HIT — {trade['inst_id']}*\n"
-                    f"Price `{round(price, dec)}` reached TP1 `{tp1}`\n"
-                    f"━━━━━━━━━━━━━━\n"
-                    f"🔒 SL moved to breakeven `{entry}`\n"
-                    f"🎯 TP2 target: `{tp2}`\n"
-                    f"🎯 TP3 target: `{tp3}`\n"
-                    f"_Trade is now risk-free._"
-                )
-            # TP2
-            elif trade["tp1_hit"] and not trade["tp2_hit"] and price >= tp2:
-                trade["tp2_hit"] = True
-                send_telegram(
-                    f"✅ *AUTO-TRADE TP2 HIT — {trade['inst_id']}*\n"
-                    f"Price `{round(price, dec)}` reached TP2 `{tp2}`\n"
-                    f"━━━━━━━━━━━━━━\n"
-                    f"🎯 TP3 still open at `{tp3}`\n"
-                    f"_Consider closing partial or letting runner go._"
-                )
-            # TP3
-            elif trade["tp2_hit"] and price >= tp3:
-                send_telegram(
-                    f"🏆 *AUTO-TRADE TP3 HIT — {trade['inst_id']}*\n"
-                    f"Price `{round(price, dec)}` reached TP3 `{tp3}`\n"
-                    f"━━━━━━━━━━━━━━\n"
-                    f"_Full target reached! Outstanding trade._"
-                )
-                trades_to_close.append((trade_id, "tp3_hit"))
+            if direction == "BUY":
+                # SL hit
+                if price <= sl:
+                    send_telegram(
+                        f"🔴 *SL HIT — {trade['inst_id']} ({tp_label})*\n"
+                        f"Price `{round(price, dec)}` hit SL `{sl}`\n"
+                        f"Entry `{entry}` | Lots `{trade['lots']}`"
+                    )
+                    trades_to_close.append((trade_id, "sl_hit"))
+                # TP hit — MT5 closes it, we just notify and move SL on others
+                elif price >= tp:
+                    send_telegram(
+                        f"✅ *{tp_label} HIT — {trade['inst_id']}*\n"
+                        f"Price `{round(price, dec)}` reached `{tp}`\n"
+                        f"💼 Lots `{trade['lots']}` closed automatically.\n"
+                        f"━━━━━━━━━━━━━━\n"
+                        + ("🔒 _Moving SL to breakeven on remaining positions._" if tp_label == "TP1" else "")
+                    )
+                    trades_to_close.append((trade_id, f"{tp_label.lower()}_hit"))
+                    # Move SL to breakeven on TP2 and TP3 positions after TP1 hits
+                    if tp_label == "TP1":
+                        for other_id, other_trade in group_trades:
+                            if other_id != trade_id and other_trade["status"] == "OPEN":
+                                move_sl_to_breakeven(other_id)
 
-        elif direction == "SELL":
-            # SL hit
-            if price >= sl:
-                send_telegram(
-                    f"🔴 *AUTO-TRADE SL HIT — {trade['inst_id']}*\n"
-                    f"Price `{round(price, dec)}` hit SL `{sl}`\n"
-                    f"Entry was `{entry}` | Lots: `{trade['lots']}`\n"
-                    f"━━━━━━━━━━━━━━\n"
-                    f"_Loss taken. Stay disciplined._"
-                )
-                trades_to_close.append((trade_id, "sl_hit"))
-            # TP1
-            elif not trade["tp1_hit"] and price <= tp1:
-                trade["tp1_hit"] = True
-                move_sl_to_breakeven(trade_id)
-                send_telegram(
-                    f"✅ *AUTO-TRADE TP1 HIT — {trade['inst_id']}*\n"
-                    f"Price `{round(price, dec)}` reached TP1 `{tp1}`\n"
-                    f"━━━━━━━━━━━━━━\n"
-                    f"🔒 SL moved to breakeven `{entry}`\n"
-                    f"🎯 TP2 target: `{tp2}`\n"
-                    f"🎯 TP3 target: `{tp3}`\n"
-                    f"_Trade is now risk-free._"
-                )
-            # TP2
-            elif trade["tp1_hit"] and not trade["tp2_hit"] and price <= tp2:
-                trade["tp2_hit"] = True
-                send_telegram(
-                    f"✅ *AUTO-TRADE TP2 HIT — {trade['inst_id']}*\n"
-                    f"Price `{round(price, dec)}` reached TP2 `{tp2}`\n"
-                    f"━━━━━━━━━━━━━━\n"
-                    f"🎯 TP3 still open at `{tp3}`\n"
-                    f"_Consider closing partial or letting runner go._"
-                )
-            # TP3
-            elif trade["tp2_hit"] and price <= tp3:
-                send_telegram(
-                    f"🏆 *AUTO-TRADE TP3 HIT — {trade['inst_id']}*\n"
-                    f"Price `{round(price, dec)}` reached TP3 `{tp3}`\n"
-                    f"━━━━━━━━━━━━━━\n"
-                    f"_Full target reached! Outstanding trade._"
-                )
-                trades_to_close.append((trade_id, "tp3_hit"))
+            elif direction == "SELL":
+                # SL hit
+                if price >= sl:
+                    send_telegram(
+                        f"🔴 *SL HIT — {trade['inst_id']} ({tp_label})*\n"
+                        f"Price `{round(price, dec)}` hit SL `{sl}`\n"
+                        f"Entry `{entry}` | Lots `{trade['lots']}`"
+                    )
+                    trades_to_close.append((trade_id, "sl_hit"))
+                # TP hit
+                elif price <= tp:
+                    send_telegram(
+                        f"✅ *{tp_label} HIT — {trade['inst_id']}*\n"
+                        f"Price `{round(price, dec)}` reached `{tp}`\n"
+                        f"💼 Lots `{trade['lots']}` closed automatically.\n"
+                        f"━━━━━━━━━━━━━━\n"
+                        + ("🔒 _Moving SL to breakeven on remaining positions._" if tp_label == "TP1" else "")
+                    )
+                    trades_to_close.append((trade_id, f"{tp_label.lower()}_hit"))
+                    if tp_label == "TP1":
+                        for other_id, other_trade in group_trades:
+                            if other_id != trade_id and other_trade["status"] == "OPEN":
+                                move_sl_to_breakeven(other_id)
 
     # Process closes
     for trade_id, reason in trades_to_close:
@@ -811,24 +808,32 @@ def format_signal(inst, a):
 def format_auto_positions():
     if not auto_trades:
         return "📭 *No open auto-trades right now.*"
-    lines = ["🤖 *Open Auto-Trade Positions*\n"]
+
+    # Group by signal_group
+    groups = {}
     for tid, t in auto_trades.items():
-        price = latest_price.get(t["inst_id"])
+        sg = t.get("signal_group", tid)
+        groups.setdefault(sg, []).append((tid, t))
+
+    lines = ["🤖 *Open Auto-Trade Positions*\n"]
+    for sg, group in groups.items():
+        # Use first trade for common info
+        _, sample = group[0]
+        price     = latest_price.get(sample["inst_id"])
         price_str = str(round(price, 2)) if price else "N/A"
-        tp1_status = "✅" if t["tp1_hit"] else "⏳"
-        tp2_status = "✅" if t["tp2_hit"] else "⏳"
-        sl_status  = "🔒 BE" if t["sl_moved"] else f"`{t['sl']}`"
-        emoji = "🟢" if t["direction"] == "BUY" else "🔴"
+        emoji     = "🟢" if sample["direction"] == "BUY" else "🔴"
         lines.append(
-            f"{emoji} *{t['inst_id']}* {t['direction']}\n"
-            f"📍 Entry: `{t['entry']}` | Now: `{price_str}`\n"
-            f"🛑 SL: {sl_status}\n"
-            f"🎯 TP1: `{t['tp1']}` {tp1_status}\n"
-            f"🎯 TP2: `{t['tp2']}` {tp2_status}\n"
-            f"🎯 TP3: `{t['tp3']}` ⏳\n"
-            f"💼 Lots: `{t['lots']}` | Opened: `{t['opened_at']}`\n"
-            f"━━━━━━━━━━━━━━"
+            f"{emoji} *{sample['inst_id']}* {sample['direction']} "
+            f"| Entry `{sample['entry']}` | Now `{price_str}`\n"
+            f"🛑 SL: `{sample['sl']}` | Opened: `{sample['opened_at']}`"
         )
+        for tid, t in sorted(group, key=lambda x: x[1].get("tp_label", "")):
+            sl_str = "🔒 BE" if t["sl_moved"] else f"`{t['sl']}`"
+            lines.append(
+                f"  • *{t.get('tp_label','TP')}*: `{t['tp']}` | "
+                f"Lots `{t['lots']}` | SL {sl_str}"
+            )
+        lines.append("━━━━━━━━━━━━━━")
     return "\n".join(lines)
 
 def format_auto_history():
@@ -1185,45 +1190,35 @@ def analysis_loop():
                             and METAAPI_TOKEN
                             and METAAPI_ACCOUNT_ID
                         ):
-                            trade_id = place_auto_trade(inst, analysis)
-                            if trade_id:
+                            result = place_auto_trade(inst, analysis)
+                            if result:
                                 auto_placed = True
                                 stats["auto_trades_today"] += 1
-                                sl_dist  = inst["sl_dist"]
-                                dec      = inst["decimals"]
-                                entry    = analysis["entry"]
+                                signal_group, placed, tp1, tp2, tp3, lot1, lot2, lot3 = result
                                 direction = sig
-
-                                if direction == "BUY":
-                                    tp1 = round(entry + sl_dist * AUTO_TP1_MULT, dec)
-                                    tp2 = round(entry + sl_dist * AUTO_TP2_MULT, dec)
-                                    tp3 = round(entry + sl_dist * AUTO_TP3_MULT, dec)
-                                else:
-                                    tp1 = round(entry - sl_dist * AUTO_TP1_MULT, dec)
-                                    tp2 = round(entry - sl_dist * AUTO_TP2_MULT, dec)
-                                    tp3 = round(entry - sl_dist * AUTO_TP3_MULT, dec)
-
-                                emoji = "🟢" if direction == "BUY" else "🔴"
-                                actual_lot = auto_trades.get(trade_id, {}).get("lots", FALLBACK_LOT)
+                                entry     = analysis["entry"]
+                                emoji     = "🟢" if direction == "BUY" else "🔴"
+                                total_lot = round(lot1 + lot2 + lot3, 2)
+                                placed_count = len(placed)
                                 send_telegram(
-                                    f"🤖 *AUTO-TRADE PLACED — {inst['id']}*\n"
+                                    f"🤖 *{placed_count}/3 POSITIONS PLACED — {inst['id']}*\n"
                                     f"{emoji} *{direction}* | ⭐ STRONG 🔥\n"
                                     f"━━━━━━━━━━━━━━\n"
                                     f"📍 Entry:  `{entry}`\n"
                                     f"🛑 SL:     `{analysis['sl']}`\n"
-                                    f"🎯 TP1:    `{tp1}` _(easy target)_\n"
-                                    f"🎯 TP2:    `{tp2}`\n"
-                                    f"🎯 TP3:    `{tp3}` _(runner)_\n"
-                                    f"💼 Lots:   `{actual_lot}` _(1% risk)_\n"
+                                    f"🎯 TP1:    `{tp1}` | Lots `{lot1}` _(50%)_\n"
+                                    f"🎯 TP2:    `{tp2}` | Lots `{lot2}` _(30%)_\n"
+                                    f"🎯 TP3:    `{tp3}` | Lots `{lot3}` _(20% runner)_\n"
+                                    f"💼 Total:  `{total_lot} lots` _(1% risk)_\n"
                                     f"━━━━━━━━━━━━━━\n"
-                                    f"🔒 SL moves to breakeven after TP1\n"
+                                    f"🔒 SL moves to breakeven after TP1 closes\n"
                                     f"⚠️ Safety close if price nears SL\n"
                                     f"_Type `auto positions` to monitor_"
                                 )
                             else:
                                 send_telegram(
                                     f"⚠️ *AUTO-TRADE FAILED — {inst['id']}*\n"
-                                    f"Could not place trade via MetaAPI.\n"
+                                    f"Could not place positions via MetaAPI.\n"
                                     f"Signal still valid — place manually if confirmed.\n"
                                     f"Entry: `{analysis['entry']}` | SL: `{analysis['sl']}`"
                                 )
