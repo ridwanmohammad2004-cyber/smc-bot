@@ -26,7 +26,6 @@ METAAPI_ACCOUNT_ID = os.environ.get("METAAPI_ACCOUNT_ID", "")
 # ─── AUTO-TRADE CONFIG ────────────────────────────────────
 AUTO_TRADE_ENABLED  = True          # Master switch
 AUTO_TRADE_SYMBOL   = "XAUUSD"      # Only auto-trade Gold for now
-AUTO_TRADE_LOT      = 0.02          # Lot size for auto-trades
 AUTO_TRADE_SESSIONS = [(8, 16), (13, 21)]  # London 08-16 UTC, NY 13-21 UTC
 
 # TP multipliers for 3-target structure
@@ -36,6 +35,19 @@ AUTO_TP3_MULT = 2.5    # Runner
 
 # Safety close: if price gets within this % of SL, close early
 SAFETY_CLOSE_PCT = 0.20   # Close if within 20% of SL distance
+
+# ─── SAFETY FEATURES ──────────────────────────────────────
+# 1. Dynamic lot sizing — 1% account risk per trade
+RISK_PCT           = 0.01   # Risk 1% of account balance per trade
+FALLBACK_LOT       = 0.02   # Used if balance fetch fails
+MIN_LOT            = 0.01   # Minimum allowed lot
+MAX_LOT            = 0.10   # Hard cap — never exceed this
+
+# 2. Daily loss kill-switch
+MAX_DAILY_LOSSES   = 3      # Disable auto-trading after 3 losses today
+
+# 3. Max simultaneous open positions
+MAX_OPEN_POSITIONS = 1      # Only 1 auto-trade open at a time
 
 # MetaAPI base URL
 META_API_URL = "https://mt-client-api-v1.london.agiliumtrade.ai"
@@ -77,6 +89,9 @@ stats = {
     "last_heartbeat": None,
     "ws_connected": False,
     "auto_trades_today": 0,
+    "daily_losses": 0,          # Safety feature 1: loss counter
+    "kill_switch_active": False, # Safety feature 1: daily kill-switch
+    "account_balance": None,     # Safety feature 1: dynamic lot sizing
 }
 announced_sessions = set()
 paused_markets     = set()
@@ -121,17 +136,95 @@ def get_metaapi_symbol(inst_id):
     }
     return mapping.get(inst_id, inst_id)
 
+# ─── SAFETY FEATURE 1: DYNAMIC LOT SIZING ────────────────
+def fetch_account_balance():
+    """Fetch live account balance from MetaAPI."""
+    if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID:
+        return None
+    try:
+        url = f"{META_API_URL}/users/current/accounts/{METAAPI_ACCOUNT_ID}/account-information"
+        r = requests.get(url, headers=metaapi_headers(), timeout=10)
+        data = r.json()
+        balance = data.get("balance") or data.get("equity")
+        if balance:
+            stats["account_balance"] = float(balance)
+            log.info(f"Account balance fetched: ${balance}")
+            return float(balance)
+    except Exception as e:
+        log.error(f"Balance fetch error: {e}")
+    return None
+
+def calculate_lot_size(sl_dist_points, inst_id):
+    """
+    Dynamic lot sizing: risk 1% of account balance per trade.
+    Formula: lot = (balance * RISK_PCT) / (sl_dist_points * pip_value)
+    """
+    balance = stats.get("account_balance") or fetch_account_balance()
+    if not balance:
+        log.warning("Balance unavailable — using fallback lot size")
+        return FALLBACK_LOT
+    try:
+        risk_amount = balance * RISK_PCT  # e.g. $529 * 0.01 = $5.29
+
+        # Pip/point value per 0.01 lot for each instrument
+        if inst_id == "XAUUSD":
+            # Gold: $1 per 1.0 point per 0.01 lot
+            point_value_per_001 = 1.0
+        elif inst_id == "NAS100":
+            # NAS100: $1 per 1.0 point per 1.0 lot → $0.01 per 0.01 lot
+            point_value_per_001 = 0.01
+        elif inst_id == "EURUSD":
+            # EUR/USD: ~$1 per pip per 0.1 lot → $0.1 per 0.01 lot
+            point_value_per_001 = 0.1
+        else:
+            point_value_per_001 = 1.0
+
+        # lot = risk_amount / (sl_points * point_value_per_lot)
+        # point_value_per_lot = point_value_per_001 * 100
+        point_value_per_lot = point_value_per_001 * 100
+        raw_lot = risk_amount / (sl_dist_points * point_value_per_lot)
+
+        # Round to 2 decimal places, clamp between MIN and MAX
+        lot = round(raw_lot, 2)
+        lot = max(MIN_LOT, min(MAX_LOT, lot))
+        log.info(f"Dynamic lot: balance=${balance:.2f} risk=${risk_amount:.2f} sl={sl_dist_points} → lot={lot}")
+        return lot
+    except Exception as e:
+        log.error(f"Lot calculation error: {e}")
+        return FALLBACK_LOT
+
 def place_auto_trade(inst, analysis):
     """Place a trade via MetaAPI. Returns trade_id or None."""
     if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID:
         log.warning("MetaAPI credentials missing — cannot auto-trade")
         return None
+
+    # ── SAFETY FEATURE 2: Max open positions guard ──
+    open_count = len(auto_trades)
+    if open_count >= MAX_OPEN_POSITIONS:
+        log.info(f"Max positions ({MAX_OPEN_POSITIONS}) reached — skipping auto-trade")
+        send_telegram(
+            f"⏸ *Auto-trade skipped — {inst['id']}*\n"
+            f"Already have {open_count} open position(s).\n"
+            f"Max allowed: `{MAX_OPEN_POSITIONS}`\n"
+            f"_Signal still valid — place manually if desired._"
+        )
+        return None
+
+    # ── SAFETY FEATURE 1: Kill-switch check ──
+    if stats.get("kill_switch_active"):
+        log.info("Kill-switch active — auto-trading disabled for today")
+        return None
+
     try:
         direction = analysis["signal"]
         entry     = analysis["entry"]
         sl        = analysis["sl"]
         sl_dist   = inst["sl_dist"]
         dec       = inst["decimals"]
+
+        # ── SAFETY FEATURE 1: Dynamic lot sizing ──
+        lot = calculate_lot_size(sl_dist, inst["id"])
 
         # 3-target TP structure
         if direction == "BUY":
@@ -150,9 +243,9 @@ def place_auto_trade(inst, analysis):
         payload = {
             "symbol":     mt5_symbol,
             "actionType": action,
-            "volume":     AUTO_TRADE_LOT,
+            "volume":     lot,
             "stopLoss":   sl,
-            "takeProfit": tp1,  # MT5 TP set to TP1 — we manage TP2/TP3 manually via monitoring
+            "takeProfit": tp1,
             "comment":    "SMC-Bot-Auto"
         }
 
@@ -184,7 +277,7 @@ def place_auto_trade(inst, analysis):
             "tp1_hit":   False,
             "tp2_hit":   False,
             "sl_moved":  False,
-            "lots":      AUTO_TRADE_LOT,
+            "lots":      lot,
             "opened_at": datetime.now(timezone.utc).strftime("%H:%M UTC"),
             "status":    "OPEN",
         }
@@ -209,13 +302,31 @@ def close_auto_trade(trade_id, reason="manual"):
         log.info(f"Close trade {trade_id}: {r.status_code} {r.text}")
 
         # Move to history
-        trade["status"] = "CLOSED"
-        trade["closed_at"] = datetime.now(timezone.utc).strftime("%H:%M UTC")
+        trade["status"]       = "CLOSED"
+        trade["closed_at"]    = datetime.now(timezone.utc).strftime("%H:%M UTC")
         trade["close_reason"] = reason
         auto_trade_history.append(dict(trade))
         if len(auto_trade_history) > 10:
             auto_trade_history.pop(0)
         del auto_trades[trade_id]
+
+        # ── SAFETY FEATURE 1: Daily loss kill-switch ──
+        if reason in ("sl_hit", "safety_close"):
+            stats["daily_losses"] += 1
+            log.info(f"Daily losses: {stats['daily_losses']}/{MAX_DAILY_LOSSES}")
+            if stats["daily_losses"] >= MAX_DAILY_LOSSES:
+                stats["kill_switch_active"] = True
+                send_telegram(
+                    f"🚨 *DAILY LOSS LIMIT REACHED*\n"
+                    f"Bot has taken `{stats['daily_losses']}` losses today.\n"
+                    f"━━━━━━━━━━━━━━\n"
+                    f"🔴 Auto-trading *DISABLED* for the rest of today.\n"
+                    f"Signals will still fire for manual review.\n"
+                    f"━━━━━━━━━━━━━━\n"
+                    f"_Auto-trading resets tomorrow at 00:00 UTC._\n"
+                    f"_Type `auto on` to override if desired._"
+                )
+
         return True
     except Exception as e:
         log.error(f"MetaAPI close_trade error: {e}")
@@ -769,20 +880,30 @@ def check_telegram_commands():
 
             elif msg == "auto status":
                 session_active = is_london_ny_session()
-                status_str = "✅ ENABLED" if AUTO_TRADE_ENABLED else "⏸ DISABLED"
-                session_str = "✅ London/NY Active" if session_active else "⏳ Outside auto-trade hours"
-                open_count  = len(auto_trades)
+                status_str     = "✅ ENABLED" if AUTO_TRADE_ENABLED else "⏸ DISABLED"
+                session_str    = "✅ London/NY Active" if session_active else "⏳ Outside auto-trade hours"
+                kill_str       = "🚨 ACTIVE — losses limit hit" if stats["kill_switch_active"] else "✅ Clear"
+                balance_str    = f"${stats['account_balance']:.2f}" if stats["account_balance"] else "Fetching..."
+                open_count     = len(auto_trades)
+                lot            = calculate_lot_size(3.5, "XAUUSD")
                 send_telegram(
                     f"🤖 *Auto-Trade Status*\n"
                     f"━━━━━━━━━━━━━━\n"
                     f"Switch: {status_str}\n"
                     f"Session: {session_str}\n"
-                    f"Instrument: `XAUUSD only`\n"
-                    f"Lot size: `{AUTO_TRADE_LOT}`\n"
-                    f"Open trades: `{open_count}`\n"
-                    f"Trades today: `{stats['auto_trades_today']}`\n"
+                    f"Kill-switch: {kill_str}\n"
                     f"━━━━━━━━━━━━━━\n"
-                    f"_STRONG signals only, London 08-16 UTC + NY 13-21 UTC_"
+                    f"💰 Account balance: `{balance_str}`\n"
+                    f"📊 Risk per trade: `{int(RISK_PCT*100)}% of balance`\n"
+                    f"💼 Current lot size: `{lot}` _(dynamic)_\n"
+                    f"🔒 Max positions: `{MAX_OPEN_POSITIONS}`\n"
+                    f"🛑 Max daily losses: `{MAX_DAILY_LOSSES}`\n"
+                    f"━━━━━━━━━━━━━━\n"
+                    f"📈 Open trades: `{open_count}`\n"
+                    f"📨 Trades today: `{stats['auto_trades_today']}`\n"
+                    f"❌ Losses today: `{stats['daily_losses']}/{MAX_DAILY_LOSSES}`\n"
+                    f"━━━━━━━━━━━━━━\n"
+                    f"_STRONG XAUUSD signals only, London + NY sessions_"
                 )
 
             # ── Standard commands ──
@@ -944,8 +1065,11 @@ def reset_daily_stats():
     if last_reset_day != today:
         stats["signals_today"]      = 0
         stats["auto_trades_today"]  = 0
+        stats["daily_losses"]       = 0       # Reset loss counter
+        stats["kill_switch_active"] = False   # Reset kill-switch
         last_reset_day = today
         announced_sessions.clear()
+        log.info("Daily stats reset — kill-switch cleared")
 
 # ─── MANUAL TP/SL MONITOR ─────────────────────────────────
 def check_tp_sl(inst, current_price):
@@ -1080,6 +1204,7 @@ def analysis_loop():
                                     tp3 = round(entry - sl_dist * AUTO_TP3_MULT, dec)
 
                                 emoji = "🟢" if direction == "BUY" else "🔴"
+                                actual_lot = auto_trades.get(trade_id, {}).get("lots", FALLBACK_LOT)
                                 send_telegram(
                                     f"🤖 *AUTO-TRADE PLACED — {inst['id']}*\n"
                                     f"{emoji} *{direction}* | ⭐ STRONG 🔥\n"
@@ -1089,7 +1214,7 @@ def analysis_loop():
                                     f"🎯 TP1:    `{tp1}` _(easy target)_\n"
                                     f"🎯 TP2:    `{tp2}`\n"
                                     f"🎯 TP3:    `{tp3}` _(runner)_\n"
-                                    f"💼 Lots:   `{AUTO_TRADE_LOT}`\n"
+                                    f"💼 Lots:   `{actual_lot}` _(1% risk)_\n"
                                     f"━━━━━━━━━━━━━━\n"
                                     f"🔒 SL moves to breakeven after TP1\n"
                                     f"⚠️ Safety close if price nears SL\n"
@@ -1136,8 +1261,21 @@ def analysis_loop():
 
 # ─── MAIN ─────────────────────────────────────────────────
 def main():
-    log.info("SMC Signal Bot v4 (Auto-Trade) — Starting")
+    log.info("SMC Signal Bot v4 (Auto-Trade + Safety) — Starting")
+
+    # Fetch account balance on startup for dynamic lot sizing
+    if METAAPI_TOKEN and METAAPI_ACCOUNT_ID:
+        balance = fetch_account_balance()
+        if balance:
+            lot = calculate_lot_size(3.5, "XAUUSD")
+            log.info(f"Startup: balance=${balance:.2f}, lot={lot}")
+        else:
+            log.warning("Could not fetch balance — using fallback lot size")
+
     auto_status = "✅ ENABLED" if (AUTO_TRADE_ENABLED and METAAPI_TOKEN) else "⚠️ DISABLED (no credentials)"
+    balance_str = f"${stats['account_balance']:.2f}" if stats["account_balance"] else "Unknown"
+    lot_str     = str(calculate_lot_size(3.5, "XAUUSD")) if stats["account_balance"] else str(FALLBACK_LOT)
+
     send_telegram(
         f"✅ *SMC Signal Bot v4 Online*\n"
         f"📊 Monitoring: `XAUUSD | NAS100 | EURUSD | USOUSD`\n"
@@ -1145,9 +1283,14 @@ def main():
         f"📡 NAS100 + USOUSD: `REST (8s)`\n"
         f"⚡ Analysis every: `{ANALYZE_INTERVAL}s`\n"
         f"🤖 Auto-Trade: {auto_status}\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"🛡️ *Safety Features Active*\n"
+        f"💰 Balance: `{balance_str}` | Lot: `{lot_str}` _(1% risk)_\n"
+        f"🔒 Max positions: `{MAX_OPEN_POSITIONS}`\n"
+        f"🛑 Kill-switch: `{MAX_DAILY_LOSSES} losses = auto-stop`\n"
+        f"━━━━━━━━━━━━━━\n"
         f"_STRONG XAUUSD signals → auto-placed during London/NY_\n"
         f"_MID signals + Asian session → manual only_\n"
-        f"━━━━━━━━━━━━━━\n"
         f"Type `help` for all commands."
     )
 
