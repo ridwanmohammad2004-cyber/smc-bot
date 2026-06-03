@@ -414,29 +414,33 @@ def analyze_candles(inst_id):
     if inst.get("buy_only") and direction == "SELL":
         return {"signal": "WAIT", "reason": "Buy-only instrument"}
 
-    # ── Signal quality gate ──
+    # ── Signal quality gate — must pass, not scored ──
     if not quality:
         return {"signal": "WAIT", "reason": "Weak signal candle — doji or wrong direction close"}
 
     if not not_late:
         return {"signal": "WAIT", "reason": "Move already extended — entry too late"}
 
-    # ── Rating ──
+    # ── Scoring — quality candle is now a gate, not a score point ──
+    # BOS is the primary confluence — always scores
+    # Extra confluences boost the score
     score = sum([
-        liq_sweep is not None,
-        bos is not None,
-        ob,
-        fvg,
-        struct_aligned and structure != "RANGING",
-        quality,
+        liq_sweep is not None,      # Liquidity sweep
+        bos is not None,            # Break of structure
+        ob,                         # Order block retest
+        fvg,                        # Fair value gap fill
+        struct_aligned and structure != "RANGING",  # Aligned structure
     ])
 
-    if score >= 3:
+    # BOS alone with quality candle = STRONG (direction confirmed)
+    # BOS + any extra confluence = STRONG
+    # No BOS but liq sweep + extra = STRONG
+    if score >= 2:
         rating = "STRONG 🔥"
-    elif score >= 2:
+    elif score >= 1:
         rating = "MID ⚡"
     else:
-        return {"signal": "WAIT", "reason": f"Insufficient confluence ({score}/6)"}
+        return {"signal": "WAIT", "reason": f"Insufficient confluence ({score}/5)"}
 
     # ── Build result ──
     tp1_mult = 0.8
@@ -480,8 +484,12 @@ def is_london_ny_session():
     return (8 <= h < 16) or (13 <= h < 21)
 
 def get_metaapi_symbol(inst_id):
-    return {"XAUUSD": "XAUUSD", "NAS100": "NAS100",
-            "EURUSD": "EURUSD", "USOUSD": "XTIUSD"}.get(inst_id, inst_id)
+    return {
+        "XAUUSD": "XAUUSD.s",
+        "NAS100": "NAS100.s",
+        "EURUSD": "EURUSD.s",
+        "USOUSD": "XTIUSD.s",
+    }.get(inst_id, inst_id)
 
 def fetch_account_balance():
     if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID:
