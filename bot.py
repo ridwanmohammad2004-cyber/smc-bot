@@ -7,7 +7,7 @@ import logging
 from datetime import datetime, timezone
 
 try:
-    import websocket  # websocket-client
+    import websocket
 except ImportError:
     websocket = None
 
@@ -18,19 +18,38 @@ log = logging.getLogger(__name__)
 TELEGRAM_TOKEN     = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "")
-ANALYZE_INTERVAL   = int(os.environ.get("ANALYZE_INTERVAL", "5"))   # how often to analyze (seconds)
+ANALYZE_INTERVAL   = int(os.environ.get("ANALYZE_INTERVAL", "5"))
 USE_WEBSOCKET      = os.environ.get("USE_WEBSOCKET", "true").lower() == "true"
+METAAPI_TOKEN      = os.environ.get("METAAPI_TOKEN", "")
+METAAPI_ACCOUNT_ID = os.environ.get("METAAPI_ACCOUNT_ID", "")
 
-# ─── INSTRUMENTS (PU Prime Islamic Standard) ──────────────
+# ─── AUTO-TRADE CONFIG ────────────────────────────────────
+AUTO_TRADE_ENABLED  = True          # Master switch
+AUTO_TRADE_SYMBOL   = "XAUUSD"      # Only auto-trade Gold for now
+AUTO_TRADE_LOT      = 0.02          # Lot size for auto-trades
+AUTO_TRADE_SESSIONS = [(8, 16), (13, 21)]  # London 08-16 UTC, NY 13-21 UTC
+
+# TP multipliers for 3-target structure
+AUTO_TP1_MULT = 0.8    # Very close — easy first target
+AUTO_TP2_MULT = 1.5    # Medium target
+AUTO_TP3_MULT = 2.5    # Runner
+
+# Safety close: if price gets within this % of SL, close early
+SAFETY_CLOSE_PCT = 0.20   # Close if within 20% of SL distance
+
+# MetaAPI base URL
+META_API_URL = "https://mt-client-api-v1.london.agiliumtrade.ai"
+
+# ─── INSTRUMENTS ──────────────────────────────────────────
 INSTRUMENTS = [
-    {"id": "XAUUSD", "label": "Gold",    "symbol": "XAU/USD",  "decimals": 2,  "sl_dist": 3.5,   "priority": 1, "ws": True,
+    {"id": "XAUUSD", "label": "Gold",    "symbol": "XAU/USD",  "decimals": 2,  "sl_dist": 3.5,    "priority": 1, "ws": True,
      "lot_strong": 0.05, "lot_mid": 0.02, "valid_min": 1000,  "valid_max": 10000},
-    {"id": "NAS100", "label": "Nasdaq",  "symbol": "US100",    "decimals": 1,  "sl_dist": 20.0,  "priority": 2, "ws": False,
+    {"id": "NAS100", "label": "Nasdaq",  "symbol": "US100",    "decimals": 1,  "sl_dist": 20.0,   "priority": 2, "ws": False,
      "lot_strong": 0.2,  "lot_mid": 0.1,  "valid_min": 10000, "valid_max": 40000, "multiplier": 1000},
-    {"id": "EURUSD", "label": "EUR/USD", "symbol": "EUR/USD",  "decimals": 5,  "sl_dist": 0.0015,"priority": 3, "ws": True,
+    {"id": "EURUSD", "label": "EUR/USD", "symbol": "EUR/USD",  "decimals": 5,  "sl_dist": 0.0015, "priority": 3, "ws": True,
      "lot_strong": 0.03, "lot_mid": 0.02, "valid_min": 0.5,   "valid_max": 2.0},
-    {"id": "USOUSD", "label": "WTI Oil", "symbol": "WTI/USD",  "decimals": 2,  "sl_dist": 0.8,   "priority": 4, "ws": False,
-     "lot_strong": 0.03, "lot_mid": 0.02, "valid_min": 30,    "valid_max": 130,  "buy_only": True},
+    {"id": "USOUSD", "label": "WTI Oil", "symbol": "WTI/USD",  "decimals": 2,  "sl_dist": 0.8,    "priority": 4, "ws": False,
+     "lot_strong": 0.03, "lot_mid": 0.02, "valid_min": 30,    "valid_max": 130, "buy_only": True},
 ]
 SYMBOL_TO_ID = {i["symbol"]: i["id"] for i in INSTRUMENTS}
 
@@ -39,14 +58,16 @@ price_history    = {i["id"]: [] for i in INSTRUMENTS}
 latest_price     = {i["id"]: None for i in INSTRUMENTS}
 last_signals     = {i["id"]: None for i in INSTRUMENTS}
 last_signal_time = {i["id"]: None for i in INSTRUMENTS}
-# Track open signals for TP/SL monitoring
-open_signals = {}  # {inst_id: {"direction": "BUY/SELL", "entry": x, "sl": x, "tp1": x, "tp2": x, "tp1_hit": False}}
-# Per-instrument cooldown in seconds
+open_signals     = {}   # manual TP/SL tracking
+auto_trades      = {}   # active auto-trades {trade_id: {...}}
+auto_trade_history = [] # closed auto-trades (last 10)
+feed_alerted     = {}
+
 COOLDOWNS = {
-    "XAUUSD": 420,   # 7 minutes
-    "NAS100": 600,   # 10 minutes
-    "EURUSD": 600,   # 10 minutes
-    "USOUSD": 600,   # 10 minutes
+    "XAUUSD": 420,
+    "NAS100": 600,
+    "EURUSD": 600,
+    "USOUSD": 600,
 }
 stats = {
     "signals_today": 0,
@@ -55,6 +76,7 @@ stats = {
     "last_signal_sent": None,
     "last_heartbeat": None,
     "ws_connected": False,
+    "auto_trades_today": 0,
 }
 announced_sessions = set()
 paused_markets     = set()
@@ -74,6 +96,276 @@ def send_telegram(text, parse_mode="Markdown"):
             log.warning(f"Telegram failed: {r.text}")
     except Exception as e:
         log.error(f"Telegram error: {e}")
+
+# ─── METAAPI HELPERS ──────────────────────────────────────
+def metaapi_headers():
+    return {
+        "auth-token": METAAPI_TOKEN,
+        "Content-Type": "application/json"
+    }
+
+def is_london_ny_session():
+    """Check if current UTC time is in London or NY session."""
+    h = datetime.now(timezone.utc).hour
+    in_london = 8 <= h < 16
+    in_ny     = 13 <= h < 21
+    return in_london or in_ny
+
+def get_metaapi_symbol(inst_id):
+    """Map our instrument ID to MetaAPI/MT5 symbol name."""
+    mapping = {
+        "XAUUSD": "XAUUSD",
+        "NAS100": "NAS100",
+        "EURUSD": "EURUSD",
+        "USOUSD": "XTIUSD",
+    }
+    return mapping.get(inst_id, inst_id)
+
+def place_auto_trade(inst, analysis):
+    """Place a trade via MetaAPI. Returns trade_id or None."""
+    if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID:
+        log.warning("MetaAPI credentials missing — cannot auto-trade")
+        return None
+    try:
+        direction = analysis["signal"]
+        entry     = analysis["entry"]
+        sl        = analysis["sl"]
+        sl_dist   = inst["sl_dist"]
+        dec       = inst["decimals"]
+
+        # 3-target TP structure
+        if direction == "BUY":
+            tp1 = round(entry + sl_dist * AUTO_TP1_MULT, dec)
+            tp2 = round(entry + sl_dist * AUTO_TP2_MULT, dec)
+            tp3 = round(entry + sl_dist * AUTO_TP3_MULT, dec)
+            action = "ORDER_TYPE_BUY"
+        else:
+            tp1 = round(entry - sl_dist * AUTO_TP1_MULT, dec)
+            tp2 = round(entry - sl_dist * AUTO_TP2_MULT, dec)
+            tp3 = round(entry - sl_dist * AUTO_TP3_MULT, dec)
+            action = "ORDER_TYPE_SELL"
+
+        mt5_symbol = get_metaapi_symbol(inst["id"])
+
+        payload = {
+            "symbol":     mt5_symbol,
+            "actionType": action,
+            "volume":     AUTO_TRADE_LOT,
+            "stopLoss":   sl,
+            "takeProfit": tp1,  # MT5 TP set to TP1 — we manage TP2/TP3 manually via monitoring
+            "comment":    "SMC-Bot-Auto"
+        }
+
+        url = f"{META_API_URL}/users/current/accounts/{METAAPI_ACCOUNT_ID}/trade"
+        r = requests.post(url, headers=metaapi_headers(), json=payload, timeout=15)
+        data = r.json()
+
+        log.info(f"MetaAPI response: {data}")
+
+        # Extract trade/order ID
+        trade_id = (
+            data.get("orderId") or
+            data.get("positionId") or
+            data.get("tradeExecutionId") or
+            str(int(time.time()))
+        )
+
+        # Store auto-trade state
+        auto_trades[trade_id] = {
+            "inst_id":   inst["id"],
+            "label":     inst["label"],
+            "direction": direction,
+            "entry":     entry,
+            "sl":        sl,
+            "sl_dist":   sl_dist,
+            "tp1":       tp1,
+            "tp2":       tp2,
+            "tp3":       tp3,
+            "tp1_hit":   False,
+            "tp2_hit":   False,
+            "sl_moved":  False,
+            "lots":      AUTO_TRADE_LOT,
+            "opened_at": datetime.now(timezone.utc).strftime("%H:%M UTC"),
+            "status":    "OPEN",
+        }
+
+        return trade_id
+
+    except Exception as e:
+        log.error(f"MetaAPI place_trade error: {e}")
+        return None
+
+def close_auto_trade(trade_id, reason="manual"):
+    """Close a trade via MetaAPI."""
+    if trade_id not in auto_trades:
+        return False
+    trade = auto_trades[trade_id]
+    try:
+        if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID:
+            return False
+
+        url = f"{META_API_URL}/users/current/accounts/{METAAPI_ACCOUNT_ID}/positions/{trade_id}/close"
+        r = requests.post(url, headers=metaapi_headers(), timeout=15)
+        log.info(f"Close trade {trade_id}: {r.status_code} {r.text}")
+
+        # Move to history
+        trade["status"] = "CLOSED"
+        trade["closed_at"] = datetime.now(timezone.utc).strftime("%H:%M UTC")
+        trade["close_reason"] = reason
+        auto_trade_history.append(dict(trade))
+        if len(auto_trade_history) > 10:
+            auto_trade_history.pop(0)
+        del auto_trades[trade_id]
+        return True
+    except Exception as e:
+        log.error(f"MetaAPI close_trade error: {e}")
+        return False
+
+def move_sl_to_breakeven(trade_id):
+    """Move SL to entry price (breakeven) via MetaAPI."""
+    if trade_id not in auto_trades:
+        return
+    trade = auto_trades[trade_id]
+    if trade.get("sl_moved"):
+        return
+    try:
+        url = f"{META_API_URL}/users/current/accounts/{METAAPI_ACCOUNT_ID}/positions/{trade_id}"
+        payload = {"stopLoss": trade["entry"]}
+        r = requests.put(url, headers=metaapi_headers(), json=payload, timeout=15)
+        log.info(f"Move SL to BE for {trade_id}: {r.status_code}")
+        trade["sl_moved"] = True
+        trade["sl"] = trade["entry"]
+    except Exception as e:
+        log.error(f"MetaAPI move_sl error: {e}")
+
+# ─── AUTO-TRADE MONITOR ───────────────────────────────────
+def monitor_auto_trades(inst, current_price):
+    """Check all open auto-trades for TP/SL/safety hits."""
+    if not auto_trades:
+        return
+    dec = inst["decimals"]
+    trades_to_close = []
+
+    for trade_id, trade in list(auto_trades.items()):
+        if trade["inst_id"] != inst["id"]:
+            continue
+        if trade["status"] != "OPEN":
+            continue
+
+        direction = trade["direction"]
+        entry     = trade["entry"]
+        sl        = trade["sl"]
+        sl_dist   = trade["sl_dist"]
+        tp1       = trade["tp1"]
+        tp2       = trade["tp2"]
+        tp3       = trade["tp3"]
+        price     = current_price
+
+        # ── Safety close: within 20% of SL ──
+        if not trade["tp1_hit"]:
+            dist_to_sl = abs(price - sl)
+            if dist_to_sl <= sl_dist * SAFETY_CLOSE_PCT:
+                send_telegram(
+                    f"⚠️ *SAFETY CLOSE — {trade['inst_id']}*\n"
+                    f"Price `{round(price, dec)}` is dangerously close to SL `{sl}`\n"
+                    f"Auto-closing trade to protect capital.\n"
+                    f"━━━━━━━━━━━━━━\n"
+                    f"_Trade closed before SL hit._"
+                )
+                trades_to_close.append((trade_id, "safety_close"))
+                continue
+
+        if direction == "BUY":
+            # SL hit
+            if price <= sl:
+                send_telegram(
+                    f"🔴 *AUTO-TRADE SL HIT — {trade['inst_id']}*\n"
+                    f"Price `{round(price, dec)}` hit SL `{sl}`\n"
+                    f"Entry was `{entry}` | Lots: `{trade['lots']}`\n"
+                    f"━━━━━━━━━━━━━━\n"
+                    f"_Loss taken. Stay disciplined._"
+                )
+                trades_to_close.append((trade_id, "sl_hit"))
+            # TP1
+            elif not trade["tp1_hit"] and price >= tp1:
+                trade["tp1_hit"] = True
+                move_sl_to_breakeven(trade_id)
+                send_telegram(
+                    f"✅ *AUTO-TRADE TP1 HIT — {trade['inst_id']}*\n"
+                    f"Price `{round(price, dec)}` reached TP1 `{tp1}`\n"
+                    f"━━━━━━━━━━━━━━\n"
+                    f"🔒 SL moved to breakeven `{entry}`\n"
+                    f"🎯 TP2 target: `{tp2}`\n"
+                    f"🎯 TP3 target: `{tp3}`\n"
+                    f"_Trade is now risk-free._"
+                )
+            # TP2
+            elif trade["tp1_hit"] and not trade["tp2_hit"] and price >= tp2:
+                trade["tp2_hit"] = True
+                send_telegram(
+                    f"✅ *AUTO-TRADE TP2 HIT — {trade['inst_id']}*\n"
+                    f"Price `{round(price, dec)}` reached TP2 `{tp2}`\n"
+                    f"━━━━━━━━━━━━━━\n"
+                    f"🎯 TP3 still open at `{tp3}`\n"
+                    f"_Consider closing partial or letting runner go._"
+                )
+            # TP3
+            elif trade["tp2_hit"] and price >= tp3:
+                send_telegram(
+                    f"🏆 *AUTO-TRADE TP3 HIT — {trade['inst_id']}*\n"
+                    f"Price `{round(price, dec)}` reached TP3 `{tp3}`\n"
+                    f"━━━━━━━━━━━━━━\n"
+                    f"_Full target reached! Outstanding trade._"
+                )
+                trades_to_close.append((trade_id, "tp3_hit"))
+
+        elif direction == "SELL":
+            # SL hit
+            if price >= sl:
+                send_telegram(
+                    f"🔴 *AUTO-TRADE SL HIT — {trade['inst_id']}*\n"
+                    f"Price `{round(price, dec)}` hit SL `{sl}`\n"
+                    f"Entry was `{entry}` | Lots: `{trade['lots']}`\n"
+                    f"━━━━━━━━━━━━━━\n"
+                    f"_Loss taken. Stay disciplined._"
+                )
+                trades_to_close.append((trade_id, "sl_hit"))
+            # TP1
+            elif not trade["tp1_hit"] and price <= tp1:
+                trade["tp1_hit"] = True
+                move_sl_to_breakeven(trade_id)
+                send_telegram(
+                    f"✅ *AUTO-TRADE TP1 HIT — {trade['inst_id']}*\n"
+                    f"Price `{round(price, dec)}` reached TP1 `{tp1}`\n"
+                    f"━━━━━━━━━━━━━━\n"
+                    f"🔒 SL moved to breakeven `{entry}`\n"
+                    f"🎯 TP2 target: `{tp2}`\n"
+                    f"🎯 TP3 target: `{tp3}`\n"
+                    f"_Trade is now risk-free._"
+                )
+            # TP2
+            elif trade["tp1_hit"] and not trade["tp2_hit"] and price <= tp2:
+                trade["tp2_hit"] = True
+                send_telegram(
+                    f"✅ *AUTO-TRADE TP2 HIT — {trade['inst_id']}*\n"
+                    f"Price `{round(price, dec)}` reached TP2 `{tp2}`\n"
+                    f"━━━━━━━━━━━━━━\n"
+                    f"🎯 TP3 still open at `{tp3}`\n"
+                    f"_Consider closing partial or letting runner go._"
+                )
+            # TP3
+            elif trade["tp2_hit"] and price <= tp3:
+                send_telegram(
+                    f"🏆 *AUTO-TRADE TP3 HIT — {trade['inst_id']}*\n"
+                    f"Price `{round(price, dec)}` reached TP3 `{tp3}`\n"
+                    f"━━━━━━━━━━━━━━\n"
+                    f"_Full target reached! Outstanding trade._"
+                )
+                trades_to_close.append((trade_id, "tp3_hit"))
+
+    # Process closes
+    for trade_id, reason in trades_to_close:
+        close_auto_trade(trade_id, reason)
 
 # ─── REST PRICE FALLBACK ──────────────────────────────────
 def fetch_twelvedata(symbol):
@@ -95,10 +387,9 @@ def on_ws_message(ws, message):
             symbol = data.get("symbol")
             price  = data.get("price")
             if symbol in SYMBOL_TO_ID and price:
-                inst_id = SYMBOL_TO_ID[symbol]
+                inst_id  = SYMBOL_TO_ID[symbol]
                 inst_obj = next((i for i in INSTRUMENTS if i["id"] == inst_id), None)
                 fp = float(price)
-                # sanity check
                 if inst_obj:
                     vmin = inst_obj.get("valid_min", 0)
                     vmax = inst_obj.get("valid_max", 999999)
@@ -122,16 +413,14 @@ def on_ws_close(ws, code, msg):
 def on_ws_open(ws):
     log.info("WebSocket connected")
     stats["ws_connected"] = True
-    # Only subscribe to WebSocket-supported instruments
     symbols = ",".join(i["symbol"] for i in INSTRUMENTS if i.get("ws"))
     sub = {"action": "subscribe", "params": {"symbols": symbols}}
     ws.send(json.dumps(sub))
     log.info(f"WS Subscribed to: {symbols}")
 
 def run_websocket():
-    """Run TwelveData WebSocket connection with auto-reconnect."""
     if websocket is None:
-        log.error("websocket-client not installed — falling back to REST")
+        log.error("websocket-client not installed")
         return
     url = f"wss://ws.twelvedata.com/v1/quotes/price?apikey={TWELVEDATA_API_KEY}"
     while True:
@@ -151,18 +440,16 @@ def run_websocket():
         time.sleep(5)
 
 def price_is_valid(inst, price):
-    """Sanity check — reject obviously wrong prices."""
     if price is None:
         return False
     vmin = inst.get("valid_min", 0)
     vmax = inst.get("valid_max", 999999)
     if price < vmin or price > vmax:
-        log.warning(f"{inst['id']} price {price} OUTSIDE valid range [{vmin}-{vmax}] — rejecting")
+        log.warning(f"{inst['id']} price {price} outside range [{vmin}-{vmax}]")
         return False
     return True
 
 def rest_poll_loop():
-    """Poll REST prices for non-WebSocket instruments (NAS100, USOUSD)."""
     while True:
         for inst in INSTRUMENTS:
             if inst.get("ws"):
@@ -175,12 +462,11 @@ def rest_poll_loop():
             if price_is_valid(inst, price):
                 latest_price[inst["id"]] = price
             elif price is not None:
-                # Wrong data — alert once and skip
                 if not feed_alerted.get(inst["id"]):
                     feed_alerted[inst["id"]] = True
                     send_telegram(
                         f"⚠️ *{inst['id']} Data Warning*\n"
-                        f"Received price `{price}` which is outside expected range.\n"
+                        f"Received price `{price}` outside expected range.\n"
                         f"Signals for {inst['id']} paused until valid data returns."
                     )
         time.sleep(8)
@@ -233,7 +519,7 @@ def detect_pattern(prices):
 def detect_liquidity_sweep(prices):
     if len(prices) < 15:
         return None
-    recent = prices[-5:]
+    recent   = prices[-5:]
     lookback = prices[-15:-5]
     prev_high, prev_low = max(lookback), min(lookback)
     last, prev = prices[-1], prices[-2]
@@ -257,15 +543,13 @@ def get_structure(prices):
     return "RANGING"
 
 def rate_signal(factors):
-    score = sum(factors.values())  # number of True factors
+    score = sum(factors.values())
     total = len(factors)
-    # STRONG: 75%+ of factors (and at least 4)
     if score >= 4 and (score / total) >= 0.7:
         return "STRONG 🔥"
-    # MID: at least 3 factors aligned
     elif score >= 3:
         return "MID ⚡"
-    return None  # fewer than 3 factors = skip (too weak)
+    return None
 
 def analyze(prices, inst):
     if len(prices) < 12:
@@ -300,12 +584,12 @@ def analyze(prices, inst):
 
     buy_signal = sell_signal = False
     reasons = []
-    if liq_sweep == "BUY":  buy_signal = True;  reasons.append("Liquidity sweep reversal")
+    if liq_sweep == "BUY":    buy_signal  = True; reasons.append("Liquidity sweep reversal")
     elif liq_sweep == "SELL": sell_signal = True; reasons.append("Liquidity sweep reversal")
-    if pattern_dir == "BUY":  buy_signal = True;  reasons.append(f"{pattern} pattern")
+    if pattern_dir == "BUY":    buy_signal  = True; reasons.append(f"{pattern} pattern")
     elif pattern_dir == "SELL": sell_signal = True; reasons.append(f"{pattern} pattern")
     if bull_struct and bull_mom and demand_retest:
-        buy_signal = True; reasons.append("HH/HL + demand retest")
+        buy_signal  = True; reasons.append("HH/HL + demand retest")
     if bear_struct and bear_mom and supply_retest:
         sell_signal = True; reasons.append("LH/LL + supply retest")
 
@@ -321,33 +605,27 @@ def analyze(prices, inst):
     )
     factors = {
         "liquidity_sweep": liq_sweep is not None,
-        "pattern": pattern is not None,
-        "structure": (bull_struct if direction=="BUY" else bear_struct),
-        "momentum": (bull_mom if direction=="BUY" else bear_mom),
-        "retest": (demand_retest if direction=="BUY" else supply_retest),
-        "struct_aligned": struct_aligned,
+        "pattern":         pattern is not None,
+        "structure":       (bull_struct if direction == "BUY" else bear_struct),
+        "momentum":        (bull_mom if direction == "BUY" else bear_mom),
+        "retest":          (demand_retest if direction == "BUY" else supply_retest),
+        "struct_aligned":  struct_aligned,
     }
-    # ── Entry confirmation: require reaction candle in signal direction ──
-    # Last price move must confirm the direction (not just pattern)
-    confirm_candle = False
-    if direction == "BUY" and prices[-1] > prices[-2]:
-        confirm_candle = True  # bullish reaction
-    elif direction == "SELL" and prices[-1] < prices[-2]:
-        confirm_candle = True  # bearish reaction
+    confirm_candle = (
+        (direction == "BUY"  and prices[-1] > prices[-2]) or
+        (direction == "SELL" and prices[-1] < prices[-2])
+    )
     factors["confirm_candle"] = confirm_candle
 
     rating = rate_signal(factors)
     if not rating:
         return {"signal": "WAIT", "reason": "Setup too weak — skipping"}
-
-    # Require confirmation candle for entry (improves win rate in ranging markets)
     if not confirm_candle:
         return {"signal": "WAIT", "reason": "Awaiting reaction candle confirmation"}
 
-    # Tighter, more achievable targets for M1 scalping
     tp1_mult, tp2_mult = 1.0, 1.8
     if "STRONG" in rating:
-        tp2_mult = 2.2  # let strong signals run a bit further
+        tp2_mult = 2.2
 
     if direction == "BUY":
         return {"signal": "BUY", "rating": rating, "entry": round(last, dec),
@@ -372,9 +650,9 @@ def estimate_profit(inst_id, entry, tp1, tp2, sl, lots):
         d_tp2 = abs(float(tp2) - float(entry))
         d_sl  = abs(float(sl)  - float(entry))
         if inst_id == "XAUUSD":
-            pv = 100 * lots          # $1 per $1 move per 0.01 lot
+            pv = 100 * lots
         elif inst_id == "NAS100":
-            pv = 1 * lots            # PU Prime: $1 per point per 1.0 lot
+            pv = 1 * lots
         elif inst_id == "USOUSD":
             pv = 1000 * lots
         elif inst_id == "EURUSD":
@@ -387,9 +665,9 @@ def estimate_profit(inst_id, entry, tp1, tp2, sl, lots):
 
 def format_signal(inst, a):
     now = datetime.now(timezone.utc).strftime("%H:%M UTC")
-    emoji = "🟢" if a["signal"] == "BUY" else "🔴"
+    emoji  = "🟢" if a["signal"] == "BUY" else "🔴"
     rating = a.get("rating", "MID ⚡")
-    lots = get_lot_recommendation(rating, inst)
+    lots   = get_lot_recommendation(rating, inst)
     p1, p2, ls = estimate_profit(inst["id"], a["entry"], a["tp1"], a["tp2"], a["sl"], lots)
     return (
         f"{emoji} *{a['signal']} — {inst['id']}* ({inst['label']})\n"
@@ -418,36 +696,122 @@ def format_signal(inst, a):
         f"⚠️ _Confirm on chart before trading_"
     )
 
+# ─── AUTO-TRADE STATUS FORMATTERS ─────────────────────────
+def format_auto_positions():
+    if not auto_trades:
+        return "📭 *No open auto-trades right now.*"
+    lines = ["🤖 *Open Auto-Trade Positions*\n"]
+    for tid, t in auto_trades.items():
+        price = latest_price.get(t["inst_id"])
+        price_str = str(round(price, 2)) if price else "N/A"
+        tp1_status = "✅" if t["tp1_hit"] else "⏳"
+        tp2_status = "✅" if t["tp2_hit"] else "⏳"
+        sl_status  = "🔒 BE" if t["sl_moved"] else f"`{t['sl']}`"
+        emoji = "🟢" if t["direction"] == "BUY" else "🔴"
+        lines.append(
+            f"{emoji} *{t['inst_id']}* {t['direction']}\n"
+            f"📍 Entry: `{t['entry']}` | Now: `{price_str}`\n"
+            f"🛑 SL: {sl_status}\n"
+            f"🎯 TP1: `{t['tp1']}` {tp1_status}\n"
+            f"🎯 TP2: `{t['tp2']}` {tp2_status}\n"
+            f"🎯 TP3: `{t['tp3']}` ⏳\n"
+            f"💼 Lots: `{t['lots']}` | Opened: `{t['opened_at']}`\n"
+            f"━━━━━━━━━━━━━━"
+        )
+    return "\n".join(lines)
+
+def format_auto_history():
+    if not auto_trade_history:
+        return "📭 *No closed auto-trades yet.*"
+    lines = ["📜 *Last Closed Auto-Trades*\n"]
+    for t in reversed(auto_trade_history[-5:]):
+        emoji = "🟢" if t["direction"] == "BUY" else "🔴"
+        reason_map = {
+            "tp3_hit":     "🏆 TP3 Hit",
+            "tp2_hit":     "✅ TP2 Hit",
+            "tp1_hit":     "✅ TP1 Hit",
+            "sl_hit":      "🔴 SL Hit",
+            "safety_close":"⚠️ Safety Close",
+            "manual":      "🖐 Manual Close",
+        }
+        outcome = reason_map.get(t.get("close_reason", ""), t.get("close_reason", "Closed"))
+        lines.append(
+            f"{emoji} *{t['inst_id']}* {t['direction']} — {outcome}\n"
+            f"Entry `{t['entry']}` | Opened `{t['opened_at']}` | Closed `{t.get('closed_at','N/A')}`\n"
+            f"━━━━━━━━━━━━━━"
+        )
+    return "\n".join(lines)
+
 # ─── COMMANDS ─────────────────────────────────────────────
 def check_telegram_commands():
-    global last_update_id
+    global last_update_id, AUTO_TRADE_ENABLED
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?timeout=1&offset={last_update_id+1}&limit=10"
         r = requests.get(url, timeout=6)
         for u in r.json().get("result", []):
             last_update_id = u.get("update_id", last_update_id)
             msg = u.get("message", {}).get("text", "").strip().lower()
-            if msg in ("/status", "status"):
+
+            # ── Auto-trade commands ──
+            if msg in ("auto positions", "auto position"):
+                send_telegram(format_auto_positions())
+
+            elif msg in ("auto history",):
+                send_telegram(format_auto_history())
+
+            elif msg == "auto off":
+                AUTO_TRADE_ENABLED = False
+                send_telegram("⏸ *Auto-trading DISABLED.*\nSignals will still fire — trades won't be placed automatically.")
+
+            elif msg == "auto on":
+                AUTO_TRADE_ENABLED = True
+                send_telegram("▶️ *Auto-trading ENABLED.*\nSTRONG signals during London/NY will be placed automatically.")
+
+            elif msg == "auto status":
+                session_active = is_london_ny_session()
+                status_str = "✅ ENABLED" if AUTO_TRADE_ENABLED else "⏸ DISABLED"
+                session_str = "✅ London/NY Active" if session_active else "⏳ Outside auto-trade hours"
+                open_count  = len(auto_trades)
+                send_telegram(
+                    f"🤖 *Auto-Trade Status*\n"
+                    f"━━━━━━━━━━━━━━\n"
+                    f"Switch: {status_str}\n"
+                    f"Session: {session_str}\n"
+                    f"Instrument: `XAUUSD only`\n"
+                    f"Lot size: `{AUTO_TRADE_LOT}`\n"
+                    f"Open trades: `{open_count}`\n"
+                    f"Trades today: `{stats['auto_trades_today']}`\n"
+                    f"━━━━━━━━━━━━━━\n"
+                    f"_STRONG signals only, London 08-16 UTC + NY 13-21 UTC_"
+                )
+
+            # ── Standard commands ──
+            elif msg in ("/status", "status"):
                 send_status()
+
             elif msg in ("/help", "help", "prompts"):
                 send_telegram(
                     "📋 *SMC Bot Commands*\n\n"
+                    "*Signals & Markets*\n"
                     "`status` — Live bot status\n"
-                    "`markets` — Active/paused markets with prices\n"
+                    "`markets` — Active markets with prices\n"
                     "`pause XAUUSD` — Pause Gold signals\n"
-                    "`pause NAS100` — Pause Nasdaq signals\n"
-                    "`pause EURUSD` — Pause EUR/USD signals\n"
-                    "`pause USOUSD` — Pause Oil signals\n"
                     "`pause all` — Pause all markets\n"
                     "`resume XAUUSD` — Resume Gold signals\n"
                     "`resume all` — Resume all markets\n"
-                    "`xauusd` — Get live Gold price\n"
-                    "`nas100` — Get live Nasdaq price\n"
-                    "`eurusd` — Get live EUR/USD price\n"
-                    "`usousd` — Get live Oil price\n"
-                    "`prompts` — Show this menu\n"
+                    "`xauusd` — Live Gold price\n"
+                    "`nas100` — Live Nasdaq price\n"
+                    "`eurusd` — Live EUR/USD price\n"
+                    "`usousd` — Live Oil price\n\n"
+                    "*Auto-Trading*\n"
+                    "`auto positions` — Open auto-trades\n"
+                    "`auto history` — Last 5 closed trades\n"
+                    "`auto status` — Auto-trade on/off + session\n"
+                    "`auto on` — Enable auto-trading\n"
+                    "`auto off` — Disable auto-trading\n\n"
                     "`help` — Show this menu"
                 )
+
             elif msg.startswith("pause"):
                 parts = msg.split()
                 t = parts[1].upper() if len(parts) > 1 else "ALL"
@@ -459,6 +823,7 @@ def check_telegram_commands():
                     send_telegram(f"⏸ *{t}* paused.")
                 else:
                     send_telegram(f"❓ Unknown: `{t}`")
+
             elif msg.startswith("resume"):
                 parts = msg.split()
                 t = parts[1].upper() if len(parts) > 1 else "ALL"
@@ -468,6 +833,7 @@ def check_telegram_commands():
                 else:
                     paused_markets.discard(t)
                     send_telegram(f"▶️ *{t}* resumed.")
+
             elif msg in ("/markets", "markets"):
                 lines = []
                 for i in INSTRUMENTS:
@@ -476,77 +842,80 @@ def check_telegram_commands():
                     pr = round(pr, i["decimals"]) if pr else "N/A"
                     lines.append(f"{st} — `{i['id']}` @ `{pr}`")
                 send_telegram("📊 *Market Status*\n\n" + "\n".join(lines))
+
             else:
-                # Check if message is an instrument name — return live price
                 inst_lookup = {i["id"].lower(): i for i in INSTRUMENTS}
                 if msg in inst_lookup:
                     i = inst_lookup[msg]
                     price = latest_price[i["id"]]
                     if price:
-                        dec = i["decimals"]
+                        dec    = i["decimals"]
                         spread = i["sl_dist"] * 0.1
                         buy_p  = round(price + spread, dec)
                         sell_p = round(price - spread, dec)
                         send_telegram(
-                            "*" + i["id"] + "* (" + i["label"] + ")\n"
-                            "━━━━━━━━━━━━━━\n"
-                            "BUY:  `" + str(buy_p) + "`\n"
-                            "SELL: `" + str(sell_p) + "`\n"
-                            "_Live price — approximate spread_"
+                            f"*{i['id']}* ({i['label']})\n"
+                            f"━━━━━━━━━━━━━━\n"
+                            f"BUY:  `{buy_p}`\n"
+                            f"SELL: `{sell_p}`\n"
+                            f"_Live price — approximate spread_"
                         )
                     else:
-                        send_telegram("No price data yet for `" + i["id"] + "` — try again in a moment.")
+                        send_telegram(f"No price data yet for `{i['id']}` — try again shortly.")
     except Exception as e:
         log.warning(f"Command error: {e}")
 
+# ─── SESSION HELPERS ──────────────────────────────────────
 def get_active_session(now):
     h = now.hour
     s = []
-    if 7 <= h < 16:  s.append("London 🇬🇧")
+    if 7  <= h < 16: s.append("London 🇬🇧")
     if 12 <= h < 21: s.append("New York 🇺🇸")
-    if 0 <= h < 9:   s.append("Tokyo 🇯🇵")
+    if 0  <= h < 9:  s.append("Tokyo 🇯🇵")
     if h >= 22 or h < 7: s.append("Sydney 🇦🇺")
     return " + ".join(s) if s else "Off-hours"
 
 def send_status():
     now = datetime.now(timezone.utc)
-    up = now - stats["start_time"]
+    up  = now - stats["start_time"]
     h, rem = divmod(int(up.total_seconds()), 3600)
-    m = rem // 60
-    ls = stats["last_scan"].strftime("%H:%M:%S UTC") if stats["last_scan"] else "N/A"
+    m   = rem // 60
+    ls  = stats["last_scan"].strftime("%H:%M:%S UTC") if stats["last_scan"] else "N/A"
     lsig = stats["last_signal_sent"].strftime("%H:%M UTC") if stats["last_signal_sent"] else "None today"
     feed = "🟢 WebSocket Live" if stats["ws_connected"] else "🟡 REST Fallback"
+    auto_str = "✅ ON" if AUTO_TRADE_ENABLED else "⏸ OFF"
     send_telegram(
         f"✅ *Bot Online*\n"
         f"🕐 Time: `{now.strftime('%H:%M:%S UTC')}`\n"
         f"⏱ Uptime: `{h}h {m}m`\n"
         f"📡 Feed: {feed}\n"
+        f"🤖 Auto-Trade: {auto_str}\n"
         f"━━━━━━━━━━━━━━\n"
         f"📊 Markets: `XAUUSD | NAS100 | EURUSD | USOUSD`\n"
-        f"🔄 Status: `Monitoring`\n"
         f"🕵️ Last analysis: `{ls}`\n"
         f"━━━━━━━━━━━━━━\n"
         f"🌍 Session: `{get_active_session(now)}`\n"
         f"📨 Signals today: `{stats['signals_today']}`\n"
+        f"🤖 Auto-trades today: `{stats['auto_trades_today']}`\n"
         f"⏰ Last signal: `{lsig}`"
     )
 
 SESSION_MSGS = {
-    "London_open":   ("🇬🇧 *London Session Open*\n`07:00 UTC` — Prime window. Watch for setups.", 7),
-    "NewYork_open":  ("🇺🇸 *New York Session Open*\n`12:00 UTC` — High volatility. Best overlap.", 12),
+    "London_open":   ("🇬🇧 *London Session Open*\n`07:00 UTC` — Prime window. Watch for setups.\n🤖 Auto-trading ACTIVE for STRONG Gold signals.", 7),
+    "NewYork_open":  ("🇺🇸 *New York Session Open*\n`12:00 UTC` — High volatility. Best overlap.\n🤖 Auto-trading ACTIVE for STRONG Gold signals.", 12),
     "London_close":  ("🇬🇧 *London Closing*\n`16:00 UTC` — Liquidity dropping.", 16),
-    "NewYork_close": ("🇺🇸 *New York Closing*\n`21:00 UTC` — Markets winding down.", 21),
-    "Asian_open":    ("🌏 *Asian Session*\n`00:00 UTC` — Lower liquidity. Wait for London.", 0),
+    "NewYork_close": ("🇺🇸 *New York Closing*\n`21:00 UTC` — Markets winding down.\n🤖 Auto-trading PAUSED until next session.", 21),
+    "Asian_open":    ("🌏 *Asian Session*\n`00:00 UTC` — Lower liquidity. Manual trades only.", 0),
 }
 
 def check_session_announcements():
     now = datetime.now(timezone.utc)
     if now.minute > 5:
         return
-    for key, (msg, h) in SESSION_MSGS.items():
+    for key, (msg_text, h) in SESSION_MSGS.items():
         dk = f"{key}_{now.date()}"
         if now.hour == h and dk not in announced_sessions:
-            send_telegram(msg)
+            send_telegram(msg_text)
             announced_sessions.add(dk)
 
 def check_heartbeat():
@@ -573,46 +942,45 @@ def reset_daily_stats():
     global last_reset_day
     today = datetime.now(timezone.utc).date()
     if last_reset_day != today:
-        stats["signals_today"] = 0
+        stats["signals_today"]      = 0
+        stats["auto_trades_today"]  = 0
         last_reset_day = today
         announced_sessions.clear()
 
-
-
-# ─── TP/SL MONITOR ────────────────────────────────────────
+# ─── MANUAL TP/SL MONITOR ─────────────────────────────────
 def check_tp_sl(inst, current_price):
     inst_id = inst["id"]
     if inst_id not in open_signals:
         return
     sig = open_signals[inst_id]
     direction = sig["direction"]
-    dec = inst["decimals"]
+    dec   = inst["decimals"]
     price = current_price
 
     if direction == "BUY":
         if not sig["tp1_hit"] and price >= sig["tp1"]:
             sig["tp1_hit"] = True
             send_telegram(
-                "*TP1 HIT — " + inst_id + "* (" + inst["label"] + ")\n"
-                "Price reached `" + str(round(price, dec)) + "`\n"
-                "TP1 was `" + str(sig["tp1"]) + "`\n"
-                "━━━━━━━━━━━━━━\n"
-                "_Move SL to breakeven now._\n"
-                "TP2 still open at `" + str(sig["tp2"]) + "`"
+                f"*TP1 HIT — {inst_id}* ({inst['label']})\n"
+                f"Price reached `{round(price, dec)}`\n"
+                f"TP1 was `{sig['tp1']}`\n"
+                f"━━━━━━━━━━━━━━\n"
+                f"_Move SL to breakeven now._\n"
+                f"TP2 still open at `{sig['tp2']}`"
             )
         elif sig["tp1_hit"] and price >= sig["tp2"]:
             send_telegram(
-                "*TP2 HIT — " + inst_id + "* (" + inst["label"] + ")\n"
-                "Price reached `" + str(round(price, dec)) + "`\n"
-                "Full target reached — close trade!"
+                f"*TP2 HIT — {inst_id}* ({inst['label']})\n"
+                f"Price reached `{round(price, dec)}`\n"
+                f"Full target reached — close trade!"
             )
             del open_signals[inst_id]
         elif price <= sig["sl"]:
             send_telegram(
-                "*SL HIT — " + inst_id + "* (" + inst["label"] + ")\n"
-                "Price dropped to `" + str(round(price, dec)) + "`\n"
-                "SL was `" + str(sig["sl"]) + "`\n"
-                "_Small loss — stay disciplined._"
+                f"*SL HIT — {inst_id}* ({inst['label']})\n"
+                f"Price dropped to `{round(price, dec)}`\n"
+                f"SL was `{sig['sl']}`\n"
+                f"_Small loss — stay disciplined._"
             )
             del open_signals[inst_id]
 
@@ -620,26 +988,26 @@ def check_tp_sl(inst, current_price):
         if not sig["tp1_hit"] and price <= sig["tp1"]:
             sig["tp1_hit"] = True
             send_telegram(
-                "*TP1 HIT — " + inst_id + "* (" + inst["label"] + ")\n"
-                "Price reached `" + str(round(price, dec)) + "`\n"
-                "TP1 was `" + str(sig["tp1"]) + "`\n"
-                "━━━━━━━━━━━━━━\n"
-                "_Move SL to breakeven now._\n"
-                "TP2 still open at `" + str(sig["tp2"]) + "`"
+                f"*TP1 HIT — {inst_id}* ({inst['label']})\n"
+                f"Price reached `{round(price, dec)}`\n"
+                f"TP1 was `{sig['tp1']}`\n"
+                f"━━━━━━━━━━━━━━\n"
+                f"_Move SL to breakeven now._\n"
+                f"TP2 still open at `{sig['tp2']}`"
             )
         elif sig["tp1_hit"] and price <= sig["tp2"]:
             send_telegram(
-                "*TP2 HIT — " + inst_id + "* (" + inst["label"] + ")\n"
-                "Price reached `" + str(round(price, dec)) + "`\n"
-                "Full target reached — close trade!"
+                f"*TP2 HIT — {inst_id}* ({inst['label']})\n"
+                f"Price reached `{round(price, dec)}`\n"
+                f"Full target reached — close trade!"
             )
             del open_signals[inst_id]
         elif price >= sig["sl"]:
             send_telegram(
-                "*SL HIT — " + inst_id + "* (" + inst["label"] + ")\n"
-                "Price rose to `" + str(round(price, dec)) + "`\n"
-                "SL was `" + str(sig["sl"]) + "`\n"
-                "_Small loss — stay disciplined._"
+                f"*SL HIT — {inst_id}* ({inst['label']})\n"
+                f"Price rose to `{round(price, dec)}`\n"
+                f"SL was `{sig['sl']}`\n"
+                f"_Small loss — stay disciplined._"
             )
             del open_signals[inst_id]
 
@@ -654,50 +1022,108 @@ def analysis_loop():
                 price = latest_price[inst["id"]]
                 if price and price > 0:
                     hist = price_history[inst["id"]]
-                    # Only append if price changed (avoid duplicate flooding)
                     if not hist or hist[-1] != price:
                         hist.append(price)
                         if len(hist) > 150:
                             hist.pop(0)
-                    # Check TP/SL on every price update
+                    # Monitor manual TP/SL
                     check_tp_sl(inst, price)
+                    # Monitor auto-trades
+                    monitor_auto_trades(inst, price)
 
                 analysis = analyze(price_history[inst["id"]], inst)
-                sig = analysis["signal"]
+                sig      = analysis["signal"]
                 prev_sig = last_signals[inst["id"]]
                 log.info(f"{inst['id']} | {price} | {sig} | {analysis.get('reason','')}")
 
                 if sig != "WAIT" and sig != prev_sig:
-                    # Cooldown check — prevent signal spam on same instrument
-                    now_t = datetime.now(timezone.utc)
+                    now_t  = datetime.now(timezone.utc)
                     last_t = last_signal_time[inst["id"]]
-                    cd = COOLDOWNS.get(inst["id"], 600)
+                    cd     = COOLDOWNS.get(inst["id"], 600)
                     in_cooldown = last_t and (now_t - last_t).total_seconds() < cd
+
                     if in_cooldown:
                         remaining = int((cd - (now_t - last_t).total_seconds()) / 60)
                         log.info(f"{inst['id']} | {sig} suppressed — cooldown {remaining}m left")
-                        last_signals[inst["id"]] = sig  # update state but don't send
+                        last_signals[inst["id"]] = sig
                     else:
                         last_signals[inst["id"]] = sig
                         last_signal_time[inst["id"]] = now_t
+                        rating = analysis.get("rating", "")
+
+                        # ── AUTO-TRADE: STRONG + XAUUSD + London/NY only ──
+                        auto_placed = False
+                        if (
+                            AUTO_TRADE_ENABLED
+                            and inst["id"] == AUTO_TRADE_SYMBOL
+                            and "STRONG" in rating
+                            and is_london_ny_session()
+                            and METAAPI_TOKEN
+                            and METAAPI_ACCOUNT_ID
+                        ):
+                            trade_id = place_auto_trade(inst, analysis)
+                            if trade_id:
+                                auto_placed = True
+                                stats["auto_trades_today"] += 1
+                                sl_dist  = inst["sl_dist"]
+                                dec      = inst["decimals"]
+                                entry    = analysis["entry"]
+                                direction = sig
+
+                                if direction == "BUY":
+                                    tp1 = round(entry + sl_dist * AUTO_TP1_MULT, dec)
+                                    tp2 = round(entry + sl_dist * AUTO_TP2_MULT, dec)
+                                    tp3 = round(entry + sl_dist * AUTO_TP3_MULT, dec)
+                                else:
+                                    tp1 = round(entry - sl_dist * AUTO_TP1_MULT, dec)
+                                    tp2 = round(entry - sl_dist * AUTO_TP2_MULT, dec)
+                                    tp3 = round(entry - sl_dist * AUTO_TP3_MULT, dec)
+
+                                emoji = "🟢" if direction == "BUY" else "🔴"
+                                send_telegram(
+                                    f"🤖 *AUTO-TRADE PLACED — {inst['id']}*\n"
+                                    f"{emoji} *{direction}* | ⭐ STRONG 🔥\n"
+                                    f"━━━━━━━━━━━━━━\n"
+                                    f"📍 Entry:  `{entry}`\n"
+                                    f"🛑 SL:     `{analysis['sl']}`\n"
+                                    f"🎯 TP1:    `{tp1}` _(easy target)_\n"
+                                    f"🎯 TP2:    `{tp2}`\n"
+                                    f"🎯 TP3:    `{tp3}` _(runner)_\n"
+                                    f"💼 Lots:   `{AUTO_TRADE_LOT}`\n"
+                                    f"━━━━━━━━━━━━━━\n"
+                                    f"🔒 SL moves to breakeven after TP1\n"
+                                    f"⚠️ Safety close if price nears SL\n"
+                                    f"_Type `auto positions` to monitor_"
+                                )
+                            else:
+                                send_telegram(
+                                    f"⚠️ *AUTO-TRADE FAILED — {inst['id']}*\n"
+                                    f"Could not place trade via MetaAPI.\n"
+                                    f"Signal still valid — place manually if confirmed.\n"
+                                    f"Entry: `{analysis['entry']}` | SL: `{analysis['sl']}`"
+                                )
+
+                        # Always send the standard signal message
                         send_telegram(format_signal(inst, analysis))
-                        stats["signals_today"] += 1
+                        stats["signals_today"]   += 1
                         stats["last_signal_sent"] = now_t
-                        stats["last_heartbeat"] = now_t
-                        # Store for TP/SL monitoring
+                        stats["last_heartbeat"]   = now_t
+
+                        # Store for manual TP/SL monitoring
                         open_signals[inst["id"]] = {
                             "direction": sig,
-                            "entry": analysis["entry"],
-                            "sl":    analysis["sl"],
-                            "tp1":   analysis["tp1"],
-                            "tp2":   analysis["tp2"],
-                            "tp1_hit": False,
+                            "entry":     analysis["entry"],
+                            "sl":        analysis["sl"],
+                            "tp1":       analysis["tp1"],
+                            "tp2":       analysis["tp2"],
+                            "tp1_hit":   False,
                         }
+
                 elif sig == "WAIT" and prev_sig in ("BUY", "SELL"):
                     last_signals[inst["id"]] = "WAIT"
                     send_telegram(
                         f"⏸ *{inst['id']}* signal cleared — now `WAIT`\n"
-                        f"_Previous signal no longer valid. Don't enter if not already in trade._"
+                        f"_Previous signal no longer valid._"
                     )
 
             reset_daily_stats()
@@ -710,34 +1136,31 @@ def analysis_loop():
 
 # ─── MAIN ─────────────────────────────────────────────────
 def main():
-    log.info("SMC Signal Bot v3 (WebSocket) — Starting")
+    log.info("SMC Signal Bot v4 (Auto-Trade) — Starting")
+    auto_status = "✅ ENABLED" if (AUTO_TRADE_ENABLED and METAAPI_TOKEN) else "⚠️ DISABLED (no credentials)"
     send_telegram(
-        "✅ *SMC Signal Bot v3 Online*\n"
-        f"📊 Monitoring: `XAUUSD | NAS100 | EURUSD`\n"
+        f"✅ *SMC Signal Bot v4 Online*\n"
+        f"📊 Monitoring: `XAUUSD | NAS100 | EURUSD | USOUSD`\n"
         f"📡 XAUUSD + EURUSD: `WebSocket (real-time)`\n"
         f"📡 NAS100 + USOUSD: `REST (8s)`\n"
         f"⚡ Analysis every: `{ANALYZE_INTERVAL}s`\n"
-        f"⭐ Ratings: `STRONG 🔥 / MID ⚡`\n"
-        f"💓 Heartbeat: every `20 mins` if no signal\n"
-        f"📡 Send `status` anytime\n"
-        f"_Signals appear here automatically._"
+        f"🤖 Auto-Trade: {auto_status}\n"
+        f"_STRONG XAUUSD signals → auto-placed during London/NY_\n"
+        f"_MID signals + Asian session → manual only_\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"Type `help` for all commands."
     )
 
-    # Start WebSocket thread for XAUUSD + EURUSD (real-time)
     if USE_WEBSOCKET and websocket:
         t_ws = threading.Thread(target=run_websocket, daemon=True)
         t_ws.start()
-        log.info("WebSocket thread started (XAUUSD, EURUSD)")
+        log.info("WebSocket thread started")
 
-    # Always start REST thread for NAS100 + USOUSD
     t_rest = threading.Thread(target=rest_poll_loop, daemon=True)
     t_rest.start()
-    log.info("REST polling thread started (NAS100, USOUSD)")
+    log.info("REST polling thread started")
 
-    # Give feed a moment to populate
     time.sleep(3)
-
-    # Run analysis loop in main thread
     analysis_loop()
 
 if __name__ == "__main__":
