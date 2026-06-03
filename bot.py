@@ -25,19 +25,28 @@ METAAPI_ACCOUNT_ID = os.environ.get("METAAPI_ACCOUNT_ID", "")
 
 # ─── AUTO-TRADE CONFIG ────────────────────────────────────
 AUTO_TRADE_ENABLED  = True
-AUTO_TRADE_SYMBOL   = "XAUUSD"
+AUTO_TRADE_SYMBOL   = "XAUUSD"     # Only auto-trade Gold
+
+# Auto-trade on BOTH MID and STRONG signals (small lots)
+AUTO_TRADE_MID      = True          # Allow MID signals to auto-trade
 
 # 3 equal positions, each with own TP
 AUTO_TP1_MULT = 0.8   # Easy first target
 AUTO_TP2_MULT = 1.5   # Medium
 AUTO_TP3_MULT = 2.5   # Runner
 
+# Profit lock — close first position when it reaches this $ profit, move others to BE
+PROFIT_LOCK_USD = 5.0   # Close position 1 at +$5, others ride to TP risk-free
+
 # ─── SAFETY FEATURES ──────────────────────────────────────
 RISK_PCT           = 0.01   # 1% account risk per trade
 FALLBACK_LOT       = 0.01
 MIN_LOT            = 0.01
 MAX_LOT            = 0.10
-MAX_DAILY_LOSSES   = 3
+
+# Dollar-based daily limits (bot's auto-trades only)
+DAILY_LOSS_LIMIT   = 50.0   # Stop ALL auto-trades if bot loses $50 total
+DAILY_PROFIT_TARGET = 100.0 # Stop auto-trades when bot makes $100 profit
 MAX_OPEN_POSITIONS = 1      # 1 signal at a time (= 3 positions)
 
 # MetaAPI
@@ -69,20 +78,26 @@ last_signal_time = {i["id"]: None for i in INSTRUMENTS}
 open_signals     = {}
 auto_trades      = {}
 auto_trade_history = []
+profit_locked_groups = set()   # signal_groups that have had first position locked at +$5
 
 COOLDOWNS = {"XAUUSD": 420, "NAS100": 600, "EURUSD": 600, "USOUSD": 600}
 
 stats = {
-    "signals_today":     0,
-    "last_scan":         None,
-    "start_time":        datetime.now(timezone.utc),
-    "last_signal_sent":  None,
-    "last_heartbeat":    None,
-    "ws_connected":      False,
-    "auto_trades_today": 0,
-    "daily_losses":      0,
-    "kill_switch_active":False,
-    "account_balance":   None,
+    "signals_today":      0,
+    "last_scan":          None,
+    "start_time":         datetime.now(timezone.utc),
+    "last_signal_sent":   None,
+    "last_heartbeat":     None,
+    "ws_connected":       False,
+    "auto_trades_today":  0,
+    "daily_pnl":          0.0,    # Bot's auto-trade net P&L today (dollars)
+    "gross_profit":       0.0,    # Sum of winning trades today
+    "gross_loss":         0.0,    # Sum of losing trades today (positive number)
+    "wins_today":         0,
+    "losses_today":       0,
+    "kill_switch_active": False,  # True when loss limit OR profit target hit
+    "kill_reason":        "",     # "loss" or "profit"
+    "account_balance":    None,
 }
 announced_sessions = set()
 paused_markets     = set()
@@ -548,18 +563,26 @@ def place_auto_trade(inst, analysis):
         now_str      = datetime.now(timezone.utc).strftime("%H:%M UTC")
         signal_group = f"{inst['id']}_{int(time.time())}"
 
-        # 3 TP levels
-        if direction == "BUY":
-            tp1 = round(entry + sl_dist * AUTO_TP1_MULT, dec)
-            tp2 = round(entry + sl_dist * AUTO_TP2_MULT, dec)
-            tp3 = round(entry + sl_dist * AUTO_TP3_MULT, dec)
-        else:
-            tp1 = round(entry - sl_dist * AUTO_TP1_MULT, dec)
-            tp2 = round(entry - sl_dist * AUTO_TP2_MULT, dec)
-            tp3 = round(entry - sl_dist * AUTO_TP3_MULT, dec)
+        # Point value per 1.0 lot (for $ target calculation)
+        pv = {"XAUUSD": 100.0, "NAS100": 1.0, "EURUSD": 100000.0, "USOUSD": 1000.0}.get(inst["id"], 100.0)
 
         # Equal lot size for all 3
         lot = calculate_lot_size(sl_dist, inst["id"])
+
+        # Position 1 target = price move that yields +$5 profit at this lot size
+        # points_for_5 = target_$ / ($ per point) ; $ per point = pv * lot
+        dollar_per_point = pv * lot
+        points_for_target = PROFIT_LOCK_USD / dollar_per_point if dollar_per_point > 0 else sl_dist * AUTO_TP1_MULT
+
+        # 3 TP levels — position 1 uses the $5 target, positions 2/3 use multipliers
+        if direction == "BUY":
+            tp1 = round(entry + points_for_target, dec)   # $5 profit level
+            tp2 = round(entry + sl_dist * AUTO_TP2_MULT, dec)
+            tp3 = round(entry + sl_dist * AUTO_TP3_MULT, dec)
+        else:
+            tp1 = round(entry - points_for_target, dec)   # $5 profit level
+            tp2 = round(entry - sl_dist * AUTO_TP2_MULT, dec)
+            tp3 = round(entry - sl_dist * AUTO_TP3_MULT, dec)
 
         # Place 3 positions
         placed = []
@@ -616,7 +639,43 @@ def place_auto_trade(inst, analysis):
         log.error(f"place_auto_trade error: {e}")
         return None
 
-def close_auto_trade(trade_id, reason="manual"):
+def point_value(inst_id):
+    return {"XAUUSD": 100.0, "NAS100": 1.0, "EURUSD": 100000.0, "USOUSD": 1000.0}.get(inst_id, 100.0)
+
+def live_profit(trade, price):
+    """Calculate current live $ profit for an open position."""
+    entry = trade["entry"]
+    lot   = trade["lots"]
+    pv    = point_value(trade["inst_id"])
+    if trade["direction"] == "BUY":
+        diff = price - entry
+    else:
+        diff = entry - price
+    return round(diff * pv * lot, 2)
+
+def calc_pnl(trade, reason, exit_price=None):
+    """Calculate dollar P&L for a closed position."""
+    entry   = trade["entry"]
+    lot     = trade["lots"]
+    inst_id = trade["inst_id"]
+    pv      = point_value(inst_id)
+
+    if exit_price is None:
+        if reason.startswith("tp"):
+            exit_price = trade["tp"]
+        elif reason == "sl_hit":
+            exit_price = trade["sl"]
+        else:
+            exit_price = trade.get("tp", entry)
+
+    if trade["direction"] == "BUY":
+        diff = exit_price - entry
+    else:
+        diff = entry - exit_price
+
+    return round(diff * pv * lot, 2)
+
+def close_auto_trade(trade_id, reason="manual", exit_price=None):
     if trade_id not in auto_trades:
         return False
     trade = auto_trades[trade_id]
@@ -625,30 +684,75 @@ def close_auto_trade(trade_id, reason="manual"):
         r = requests.post(url, headers=metaapi_headers(), timeout=15)
         log.info(f"Close {trade_id}: {r.status_code}")
 
+        # Calculate P&L — profit_lock uses live exit price
+        if reason == "profit_lock" and exit_price is None:
+            exit_price = latest_price.get(trade["inst_id"])
+        pnl = calc_pnl(trade, reason, exit_price)
+        stats["daily_pnl"] = round(stats["daily_pnl"] + pnl, 2)
+
         trade["status"]       = "CLOSED"
         trade["closed_at"]    = datetime.now(timezone.utc).strftime("%H:%M UTC")
         trade["close_reason"] = reason
+        trade["pnl"]          = pnl
         auto_trade_history.append(dict(trade))
-        if len(auto_trade_history) > 10:
+        if len(auto_trade_history) > 20:
             auto_trade_history.pop(0)
         del auto_trades[trade_id]
 
-        # Kill-switch counter
-        if reason in ("sl_hit",):
-            stats["daily_losses"] += 1
-            log.info(f"Daily losses: {stats['daily_losses']}/{MAX_DAILY_LOSSES}")
-            if stats["daily_losses"] >= MAX_DAILY_LOSSES:
-                stats["kill_switch_active"] = True
-                send_telegram(
-                    f"🚨 *DAILY LOSS LIMIT REACHED*\n"
-                    f"`{stats['daily_losses']}` losses today.\n"
-                    f"🔴 Auto-trading *DISABLED* for rest of today.\n"
-                    f"_Resets at 00:00 UTC. Type `auto on` to override._"
-                )
+        # Track wins/losses
+        if pnl > 0:
+            stats["wins_today"] += 1
+            stats["gross_profit"] = round(stats["gross_profit"] + pnl, 2)
+        elif pnl < 0:
+            stats["losses_today"] += 1
+            stats["gross_loss"] = round(stats["gross_loss"] + abs(pnl), 2)
+
+        log.info(f"Trade closed: {reason} | P&L ${pnl} | Daily P&L ${stats['daily_pnl']}")
+
+        # ── Check dollar-based limits ──
+        check_daily_limits()
+
         return True
     except Exception as e:
         log.error(f"close_trade error: {e}")
         return False
+
+def check_daily_limits():
+    """Check if daily loss limit or profit target reached. Disable auto-trading if so."""
+    if stats["kill_switch_active"]:
+        return
+
+    pnl = stats["daily_pnl"]
+
+    # Loss limit hit
+    if pnl <= -DAILY_LOSS_LIMIT:
+        stats["kill_switch_active"] = True
+        stats["kill_reason"] = "loss"
+        send_telegram(
+            f"🚨 *DAILY LOSS LIMIT HIT*\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"📉 Bot P&L today: *-${abs(pnl):.2f}*\n"
+            f"Limit was: `-${DAILY_LOSS_LIMIT:.0f}`\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"🔴 *ALL auto-trading STOPPED for today.*\n"
+            f"Signals still come through for manual review.\n"
+            f"_Resets at 00:00 UTC._"
+        )
+
+    # Profit target hit
+    elif pnl >= DAILY_PROFIT_TARGET:
+        stats["kill_switch_active"] = True
+        stats["kill_reason"] = "profit"
+        send_telegram(
+            f"🎯 *DAILY PROFIT TARGET HIT!*\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"💰 Bot P&L today: *+${pnl:.2f}*\n"
+            f"Target was: `+${DAILY_PROFIT_TARGET:.0f}`\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"✅ *Auto-trading STOPPED — target reached!*\n"
+            f"Great day. Signals still come through for manual.\n"
+            f"_Resets at 00:00 UTC. Type `auto on` to keep trading._"
+        )
 
 def move_sl_to_breakeven(trade_id):
     if trade_id not in auto_trades:
@@ -683,7 +787,46 @@ def monitor_auto_trades(inst_id, current_price):
         groups.setdefault(sg, []).append((tid, trade))
 
     for sg, group in groups.items():
+        # ── PROFIT LOCK: close first position at +$5, move others to BE ──
+        if sg not in profit_locked_groups:
+            # All positions share entry/lot so live profit is the same — use first
+            _, sample = group[0]
+            prof = live_profit(sample, current_price)
+            if prof >= PROFIT_LOCK_USD:
+                # Find the TP1 position to close (or first available)
+                tp1_pos = None
+                for tid, t in group:
+                    if t.get("tp_label") == "TP1":
+                        tp1_pos = (tid, t)
+                        break
+                if tp1_pos is None:
+                    tp1_pos = group[0]
+
+                lock_id, lock_trade = tp1_pos
+                profit_locked_groups.add(sg)
+
+                send_telegram(
+                    f"💰 *PROFIT LOCKED — {lock_trade['inst_id']}*\n"
+                    f"━━━━━━━━━━━━━━\n"
+                    f"✅ Position 1 closed at *+${prof:.2f}*\n"
+                    f"📍 Entry `{lock_trade['entry']}` → `{round(current_price,dec)}`\n"
+                    f"━━━━━━━━━━━━━━\n"
+                    f"🔒 Remaining 2 positions → breakeven\n"
+                    f"🎯 Now riding to their TPs risk-free."
+                )
+                close_auto_trade(lock_id, "profit_lock")
+
+                # Move remaining positions to breakeven
+                for oid, ot in group:
+                    if oid != lock_id and ot["status"] == "OPEN":
+                        move_sl_to_breakeven(oid)
+
+                # Refresh group after closing
+                group = [(tid, t) for tid, t in group if tid in auto_trades]
+
         for trade_id, trade in group:
+            if trade_id not in auto_trades:
+                continue
             direction = trade["direction"]
             entry     = trade["entry"]
             sl        = trade["sl"]
@@ -822,17 +965,18 @@ def format_auto_history():
         return "📭 *No closed auto-trades yet.*"
     lines = ["📜 *Last Closed Auto-Trades*\n"]
     reason_map = {
-        "tp3_hit": "🏆 TP3 Hit", "tp2_hit": "✅ TP2 Hit",
-        "tp1_hit": "✅ TP1 Hit", "sl_hit":  "🔴 SL Hit",
-        "manual":  "🖐 Manual",
+        "tp3_hit":     "🏆 TP3 Hit", "tp2_hit": "✅ TP2 Hit",
+        "tp1_hit":     "✅ TP1 Hit", "sl_hit":  "🔴 SL Hit",
+        "profit_lock": "💰 +$5 Locked", "manual": "🖐 Manual",
     }
-    for t in reversed(auto_trade_history[-5:]):
+    for t in reversed(auto_trade_history[-6:]):
         emoji   = "🟢" if t["direction"] == "BUY" else "🔴"
         outcome = reason_map.get(t.get("close_reason",""), t.get("close_reason","Closed"))
+        pnl     = t.get("pnl", 0)
+        pnl_str = f"`+${pnl:.2f}`" if pnl >= 0 else f"`-${abs(pnl):.2f}`"
         lines.append(
-            f"{emoji} *{t['inst_id']}* {t['direction']} — {outcome}\n"
-            f"Entry `{t['entry']}` | {t.get('tp_label','')} `{t.get('tp','')}`\n"
-            f"Opened `{t['opened_at']}` | Closed `{t.get('closed_at','N/A')}`\n"
+            f"{emoji} *{t['inst_id']}* {t['direction']} — {outcome} {pnl_str}\n"
+            f"Entry `{t['entry']}` → `{t.get('tp','')}` | Closed `{t.get('closed_at','N/A')}`\n"
             f"━━━━━━━━━━━━━━"
         )
     return "\n".join(lines)
@@ -927,8 +1071,14 @@ def reset_daily_stats():
     if last_reset_day != today:
         stats["signals_today"]       = 0
         stats["auto_trades_today"]   = 0
-        stats["daily_losses"]        = 0
+        stats["daily_pnl"]           = 0.0
+        stats["gross_profit"]        = 0.0
+        stats["gross_loss"]          = 0.0
+        stats["wins_today"]          = 0
+        stats["losses_today"]        = 0
         stats["kill_switch_active"]  = False
+        stats["kill_reason"]         = ""
+        profit_locked_groups.clear()
         last_reset_day = today
         announced_sessions.clear()
         log.info("Daily stats reset")
@@ -942,20 +1092,29 @@ def send_status():
     lsig = stats["last_signal_sent"].strftime("%H:%M UTC") if stats["last_signal_sent"] else "None"
     auto_str = "✅ ON" if AUTO_TRADE_ENABLED else "⏸ OFF"
     bal_str  = f"${stats['account_balance']:.2f}" if stats["account_balance"] else "Unknown"
+    pnl      = stats["daily_pnl"]
+    pnl_emoji = "💰" if pnl >= 0 else "📉"
+    if stats["kill_switch_active"]:
+        if stats["kill_reason"] == "profit":
+            auto_str = "🎯 STOPPED (target hit)"
+        elif stats["kill_reason"] == "loss":
+            auto_str = "🚨 STOPPED (loss limit)"
     send_telegram(
         f"✅ *Bot Online — Candle Engine v5*\n"
         f"🕐 `{now.strftime('%H:%M:%S UTC')}` | Uptime `{h}h {m}m`\n"
         f"━━━━━━━━━━━━━━\n"
-        f"🤖 Auto-Trade: {auto_str} | Balance: `{bal_str}`\n"
-        f"📊 Signals today: `{stats['signals_today']}`\n"
-        f"🤖 Auto-trades today: `{stats['auto_trades_today']}`\n"
-        f"❌ Losses today: `{stats['daily_losses']}/{MAX_DAILY_LOSSES}`\n"
+        f"🤖 Auto-Trade: {auto_str}\n"
+        f"💵 Account: `{bal_str}`\n"
+        f"{pnl_emoji} Bot P&L today: `${pnl:.2f}`\n"
+        f"   Target `+${DAILY_PROFIT_TARGET:.0f}` | Limit `-${DAILY_LOSS_LIMIT:.0f}`\n"
+        f"✅ Wins: `{stats['wins_today']}` | ❌ Losses: `{stats['losses_today']}`\n"
         f"━━━━━━━━━━━━━━\n"
+        f"📊 Signals today: `{stats['signals_today']}`\n"
+        f"🤖 Auto-trades: `{stats['auto_trades_today']}`\n"
         f"🌍 Session: `{get_active_session(now)}`\n"
-        f"🕵️ Last scan: `{ls}`\n"
         f"⏰ Last signal: `{lsig}`\n"
         f"━━━━━━━━━━━━━━\n"
-        f"_1M candle engine — signals fire on candle close_"
+        f"_MID + STRONG auto-trade (London/NY) • Asia = STRONG alerts only_"
     )
 
 # ─── TELEGRAM COMMANDS ────────────────────────────────────
@@ -977,30 +1136,98 @@ def check_telegram_commands():
                 send_telegram("⏸ *Auto-trading DISABLED.*")
             elif msg == "auto on":
                 AUTO_TRADE_ENABLED = True
-                send_telegram("▶️ *Auto-trading ENABLED.*")
+                stats["kill_switch_active"] = False
+                stats["kill_reason"] = ""
+                send_telegram("▶️ *Auto-trading ENABLED.*\n_Limits reset for the session._")
             elif msg == "auto status":
                 session_active = is_london_ny_session()
-                kill_str   = "🚨 ACTIVE" if stats["kill_switch_active"] else "✅ Clear"
                 bal_str    = f"${stats['account_balance']:.2f}" if stats["account_balance"] else "Fetching..."
                 lot        = calculate_lot_size(3.5, "XAUUSD")
+                pnl        = stats["daily_pnl"]
+                pnl_emoji  = "💰" if pnl >= 0 else "📉"
+                if stats["kill_switch_active"]:
+                    if stats["kill_reason"] == "profit":
+                        kill_str = "🎯 Target hit — stopped"
+                    else:
+                        kill_str = "🚨 Loss limit — stopped"
+                else:
+                    kill_str = "✅ Active"
                 send_telegram(
                     f"🤖 *Auto-Trade Status*\n"
                     f"━━━━━━━━━━━━━━\n"
                     f"Switch: {'✅ ENABLED' if AUTO_TRADE_ENABLED else '⏸ DISABLED'}\n"
-                    f"Session: {'✅ London/NY Active' if session_active else '⏳ Outside hours'}\n"
-                    f"Kill-switch: {kill_str}\n"
+                    f"Session: {'✅ London/NY Active' if session_active else '🌏 Asian/Off — STRONG alerts only'}\n"
+                    f"Status: {kill_str}\n"
+                    f"Trades: `MID + STRONG` | `XAUUSD.s only`\n"
                     f"━━━━━━━━━━━━━━\n"
-                    f"💰 Balance: `{bal_str}`\n"
-                    f"💼 Lot size: `{lot}` _(1% risk dynamic)_\n"
-                    f"🔒 Max signals: `{MAX_OPEN_POSITIONS}`\n"
-                    f"🛑 Max losses: `{MAX_DAILY_LOSSES}`\n"
+                    f"💵 Account: `{bal_str}`\n"
+                    f"{pnl_emoji} Bot P&L today: `${pnl:.2f}`\n"
+                    f"🎯 Profit target: `+${DAILY_PROFIT_TARGET:.0f}`\n"
+                    f"🛑 Loss limit: `-${DAILY_LOSS_LIMIT:.0f}`\n"
+                    f"💼 Lot size: `{lot}` _(1% risk)_\n"
                     f"━━━━━━━━━━━━━━\n"
                     f"📈 Open trades: `{len(auto_trades)}`\n"
-                    f"📨 Trades today: `{stats['auto_trades_today']}`\n"
-                    f"❌ Losses today: `{stats['daily_losses']}/{MAX_DAILY_LOSSES}`"
+                    f"✅ Wins: `{stats['wins_today']}` | ❌ Losses: `{stats['losses_today']}`"
                 )
             elif msg in ("/status", "status"):
                 send_status()
+            elif msg == "profits":
+                gp = stats["gross_profit"]
+                wins = stats["wins_today"]
+                # List winning trades
+                win_lines = []
+                for t in auto_trade_history:
+                    if t.get("pnl", 0) > 0:
+                        win_lines.append(
+                            f"  • {t['inst_id']} {t.get('tp_label','')} `+${t['pnl']:.2f}` ({t.get('close_reason','')})"
+                        )
+                detail = "\n".join(win_lines[-10:]) if win_lines else "  _No winning trades yet today._"
+                send_telegram(
+                    f"💰 *Today's Profits*\n"
+                    f"━━━━━━━━━━━━━━\n"
+                    f"✅ Winning trades: `{wins}`\n"
+                    f"💵 Total profit: *+${gp:.2f}*\n"
+                    f"━━━━━━━━━━━━━━\n"
+                    f"{detail}\n"
+                    f"━━━━━━━━━━━━━━\n"
+                    f"🎯 Target: `+${DAILY_PROFIT_TARGET:.0f}` "
+                    f"({int(min(100, stats['daily_pnl']/DAILY_PROFIT_TARGET*100)) if stats['daily_pnl']>0 else 0}%)"
+                )
+            elif msg == "losses":
+                gl = stats["gross_loss"]
+                losses = stats["losses_today"]
+                loss_lines = []
+                for t in auto_trade_history:
+                    if t.get("pnl", 0) < 0:
+                        loss_lines.append(
+                            f"  • {t['inst_id']} {t.get('tp_label','')} `-${abs(t['pnl']):.2f}` ({t.get('close_reason','')})"
+                        )
+                detail = "\n".join(loss_lines[-10:]) if loss_lines else "  _No losing trades today._"
+                send_telegram(
+                    f"📉 *Today's Losses*\n"
+                    f"━━━━━━━━━━━━━━\n"
+                    f"❌ Losing trades: `{losses}`\n"
+                    f"💸 Total loss: *-${gl:.2f}*\n"
+                    f"━━━━━━━━━━━━━━\n"
+                    f"{detail}\n"
+                    f"━━━━━━━━━━━━━━\n"
+                    f"🛑 Limit: `-${DAILY_LOSS_LIMIT:.0f}` "
+                    f"({int(min(100, gl/DAILY_LOSS_LIMIT*100))}% used)"
+                )
+            elif msg in ("pnl", "p&l", "net"):
+                gp = stats["gross_profit"]
+                gl = stats["gross_loss"]
+                net = stats["daily_pnl"]
+                net_emoji = "💰" if net >= 0 else "📉"
+                send_telegram(
+                    f"{net_emoji} *Today's Net P&L*\n"
+                    f"━━━━━━━━━━━━━━\n"
+                    f"💵 Gross profit: `+${gp:.2f}`\n"
+                    f"💸 Gross loss: `-${gl:.2f}`\n"
+                    f"━━━━━━━━━━━━━━\n"
+                    f"📊 *NET: ${net:.2f}*\n"
+                    f"✅ Wins `{stats['wins_today']}` | ❌ Losses `{stats['losses_today']}`"
+                )
             elif msg in ("/help", "help", "prompts"):
                 send_telegram(
                     "📋 *SMC Bot Commands*\n\n"
@@ -1012,9 +1239,13 @@ def check_telegram_commands():
                     "`xauusd` `nas100` `eurusd` `usousd` — Live price\n\n"
                     "*Auto-Trading*\n"
                     "`auto positions` — Open trades\n"
-                    "`auto history` — Last 5 closed\n"
+                    "`auto history` — Last closed\n"
                     "`auto status` — Full status\n"
                     "`auto on` / `auto off`\n\n"
+                    "*Profit & Loss*\n"
+                    "`profits` — Today's winning trades\n"
+                    "`losses` — Today's losing trades\n"
+                    "`pnl` — Net P&L summary\n\n"
                     "_Engine: 1M candle close signals_"
                 )
             elif msg.startswith("pause"):
@@ -1146,14 +1377,21 @@ def analysis_loop():
                         last_signals[inst_id]      = sig
                         last_signal_time[inst_id]  = now_t
                         rating = analysis.get("rating", "")
+                        london_ny = is_london_ny_session()
 
-                        # ── AUTO-TRADE ──
+                        # ── AUTO-TRADE LOGIC ──
+                        # London/NY: auto-trade MID + STRONG
+                        # Asian session: NO auto-trade (STRONG alerts only for manual)
+                        is_strong = "STRONG" in rating
+                        is_mid    = "MID" in rating
+                        tradeable_rating = is_strong or (is_mid and AUTO_TRADE_MID)
+
                         auto_placed = False
                         if (
                             AUTO_TRADE_ENABLED
                             and inst_id == AUTO_TRADE_SYMBOL
-                            and "STRONG" in rating
-                            and is_london_ny_session()
+                            and tradeable_rating
+                            and london_ny              # Only London/NY — never Asia
                             and METAAPI_TOKEN
                             and METAAPI_ACCOUNT_ID
                         ):
@@ -1165,7 +1403,7 @@ def analysis_loop():
                                 emoji = "🟢" if sig == "BUY" else "🔴"
                                 send_telegram(
                                     f"🤖 *{len(placed)}/3 POSITIONS PLACED — {inst_id}*\n"
-                                    f"{emoji} *{sig}* | ⭐ STRONG 🔥\n"
+                                    f"{emoji} *{sig}* | ⭐ {rating}\n"
                                     f"━━━━━━━━━━━━━━\n"
                                     f"📍 Entry: `{analysis['entry']}`\n"
                                     f"🛑 SL:    `{analysis['sl']}`\n"
@@ -1174,7 +1412,7 @@ def analysis_loop():
                                     f"🎯 TP3:   `{tp3}` | `{lot}` lots\n"
                                     f"━━━━━━━━━━━━━━\n"
                                     f"🔒 SL → breakeven after TP1\n"
-                                    f"_Each position closes at its own TP_\n"
+                                    f"💰 Daily P&L: `${stats['daily_pnl']:.2f}`\n"
                                     f"_Type `auto positions` to monitor_"
                                 )
                             else:
@@ -1184,21 +1422,30 @@ def analysis_loop():
                                     f"Entry `{analysis['entry']}` | SL `{analysis['sl']}`"
                                 )
 
-                        # Always send signal alert
-                        send_telegram(format_signal(inst, analysis))
-                        stats["signals_today"]   += 1
-                        stats["last_signal_sent"] = now_t
-                        stats["last_heartbeat"]   = now_t
+                        # ── SIGNAL ALERT FILTER ──
+                        # Asian session: only show STRONG signals (suppress MID)
+                        # London/NY: show all signals
+                        suppress_alert = (
+                            not london_ny           # Asian/off-hours
+                            and "STRONG" not in rating  # and not strong
+                        )
 
-                        # Store for manual monitoring
-                        open_signals[inst_id] = {
-                            "direction": sig,
-                            "entry":     analysis["entry"],
-                            "sl":        analysis["sl"],
-                            "tp1":       analysis["tp1"],
-                            "tp2":       analysis["tp2"],
-                            "tp1_hit":   False,
-                        }
+                        if not suppress_alert:
+                            session_tag = "" if london_ny else "\n🌏 _Asian session — manual review only_"
+                            send_telegram(format_signal(inst, analysis) + session_tag)
+                            stats["signals_today"]   += 1
+                            stats["last_signal_sent"] = now_t
+                            stats["last_heartbeat"]   = now_t
+
+                            # Store for manual monitoring
+                            open_signals[inst_id] = {
+                                "direction": sig,
+                                "entry":     analysis["entry"],
+                                "sl":        analysis["sl"],
+                                "tp1":       analysis["tp1"],
+                                "tp2":       analysis["tp2"],
+                                "tp1_hit":   False,
+                            }
 
                 elif sig == "WAIT" and prev_sig in ("BUY", "SELL"):
                     last_signals[inst_id] = "WAIT"
@@ -1235,13 +1482,15 @@ def main():
         f"📊 Analysis: `1M closed candles every 60s`\n"
         f"🤖 Auto-Trade: {auto_str}\n"
         f"━━━━━━━━━━━━━━\n"
-        f"🛡️ *Safety Features*\n"
-        f"💰 Balance: `{bal_str}` | Lot: `{lot_str}` _(1% risk)_\n"
-        f"🔒 Max signals: `{MAX_OPEN_POSITIONS}`\n"
-        f"🛑 Kill-switch: `{MAX_DAILY_LOSSES} losses = stop`\n"
+        f"🛡️ *Auto-Trade Rules*\n"
+        f"💵 Account: `{bal_str}` | Lot: `{lot_str}`\n"
+        f"📈 Trades: `MID + STRONG` on `XAUUSD.s`\n"
+        f"🎯 Daily target: `+${DAILY_PROFIT_TARGET:.0f}` → stops\n"
+        f"🛑 Daily loss limit: `-${DAILY_LOSS_LIMIT:.0f}` → stops\n"
+        f"⏰ London/NY only — Asia = STRONG alerts only\n"
         f"━━━━━━━━━━━━━━\n"
-        f"_Signals fire on candle CLOSE — no more late entries_\n"
-        f"_STRONG XAUUSD → auto-placed London/NY only_\n"
+        f"_3 equal positions per signal, each own TP_\n"
+        f"_SL → breakeven after TP1 hits_\n"
         f"Type `help` for commands."
     )
 
