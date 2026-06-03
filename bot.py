@@ -27,10 +27,10 @@ METAAPI_ACCOUNT_ID = os.environ.get("METAAPI_ACCOUNT_ID", "")
 AUTO_TRADE_ENABLED  = True
 AUTO_TRADE_SYMBOL   = "XAUUSD"
 
-# TP multipliers
-AUTO_TP1_MULT = 0.8
-AUTO_TP2_MULT = 1.5
-AUTO_TP3_MULT = 2.5
+# 3 equal positions, each with own TP
+AUTO_TP1_MULT = 0.8   # Easy first target
+AUTO_TP2_MULT = 1.5   # Medium
+AUTO_TP3_MULT = 2.5   # Runner
 
 # ─── SAFETY FEATURES ──────────────────────────────────────
 RISK_PCT           = 0.01   # 1% account risk per trade
@@ -38,7 +38,7 @@ FALLBACK_LOT       = 0.01
 MIN_LOT            = 0.01
 MAX_LOT            = 0.10
 MAX_DAILY_LOSSES   = 3
-MAX_OPEN_POSITIONS = 1      # 1 signal = 3 positions
+MAX_OPEN_POSITIONS = 1      # 1 signal at a time (= 3 positions)
 
 # MetaAPI
 META_API_URL = "https://mt-client-api-v1.london.agiliumtrade.ai"
@@ -431,9 +431,9 @@ def analyze_candles(inst_id):
         quality,
     ])
 
-    if score >= 4:
+    if score >= 3:
         rating = "STRONG 🔥"
-    elif score >= 3:
+    elif score >= 2:
         rating = "MID ⚡"
     else:
         return {"signal": "WAIT", "reason": f"Insufficient confluence ({score}/6)"}
@@ -513,39 +513,19 @@ def calculate_lot_size(sl_dist, inst_id):
         return FALLBACK_LOT
 
 # ─── AUTO-TRADE PLACEMENT ─────────────────────────────────
-def place_single_order(mt5_symbol, action, lot, sl, tp, label):
-    try:
-        payload = {
-            "symbol":     mt5_symbol,
-            "actionType": action,
-            "volume":     lot,
-            "stopLoss":   sl,
-            "takeProfit": tp,
-            "comment":    f"SMC-{label}"
-        }
-        url = f"{META_API_URL}/users/current/accounts/{METAAPI_ACCOUNT_ID}/trade"
-        r   = requests.post(url, headers=metaapi_headers(), json=payload, timeout=15)
-        data = r.json()
-        log.info(f"MetaAPI [{label}]: {data}")
-        return (data.get("orderId") or data.get("positionId") or
-                data.get("tradeExecutionId") or f"{label}_{int(time.time())}")
-    except Exception as e:
-        log.error(f"Order error [{label}]: {e}")
-        return None
-
 def place_auto_trade(inst, analysis):
     if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID:
         return None
     if stats.get("kill_switch_active"):
         return None
 
-    # Max open signals guard
-    active_signals = set(t.get("signal_group") for t in auto_trades.values())
-    if len(active_signals) >= MAX_OPEN_POSITIONS:
+    # Max open signals guard — count unique signal groups
+    active_groups = set(t.get("signal_group") for t in auto_trades.values() if t.get("signal_group"))
+    if len(active_groups) >= MAX_OPEN_POSITIONS:
         send_telegram(
             f"⏸ *Auto-trade skipped — {inst['id']}*\n"
-            f"Already have {len(active_signals)} active signal(s).\n"
-            f"_Signal still valid — place manually if desired._"
+            f"Already have {len(active_groups)} active signal(s).\n"
+            f"_Signal valid — place manually if desired._"
         )
         return None
 
@@ -560,6 +540,7 @@ def place_auto_trade(inst, analysis):
         now_str      = datetime.now(timezone.utc).strftime("%H:%M UTC")
         signal_group = f"{inst['id']}_{int(time.time())}"
 
+        # 3 TP levels
         if direction == "BUY":
             tp1 = round(entry + sl_dist * AUTO_TP1_MULT, dec)
             tp2 = round(entry + sl_dist * AUTO_TP2_MULT, dec)
@@ -569,16 +550,34 @@ def place_auto_trade(inst, analysis):
             tp2 = round(entry - sl_dist * AUTO_TP2_MULT, dec)
             tp3 = round(entry - sl_dist * AUTO_TP3_MULT, dec)
 
-        total_lot = calculate_lot_size(sl_dist, inst["id"])
-        lot1 = max(MIN_LOT, round(total_lot * 0.50, 2))
-        lot2 = max(MIN_LOT, round(total_lot * 0.30, 2))
-        lot3 = max(MIN_LOT, round(total_lot * 0.20, 2))
+        # Equal lot size for all 3
+        lot = calculate_lot_size(sl_dist, inst["id"])
 
+        # Place 3 positions
         placed = []
-        for lot, tp, label in [(lot1, tp1, "TP1"), (lot2, tp2, "TP2"), (lot3, tp3, "TP3")]:
-            tid = place_single_order(mt5_symbol, action, lot, sl, tp, label)
-            if tid:
-                auto_trades[tid] = {
+        for tp, label in [(tp1, "TP1"), (tp2, "TP2"), (tp3, "TP3")]:
+            try:
+                payload = {
+                    "symbol":     mt5_symbol,
+                    "actionType": action,
+                    "volume":     lot,
+                    "stopLoss":   sl,
+                    "takeProfit": tp,
+                    "comment":    f"SMC-{label}"
+                }
+                url  = f"{META_API_URL}/users/current/accounts/{METAAPI_ACCOUNT_ID}/trade"
+                r    = requests.post(url, headers=metaapi_headers(), json=payload, timeout=15)
+                data = r.json()
+                log.info(f"MetaAPI [{label}]: {data}")
+
+                trade_id = (
+                    data.get("orderId") or
+                    data.get("positionId") or
+                    data.get("tradeExecutionId") or
+                    f"{label}_{int(time.time())}"
+                )
+
+                auto_trades[trade_id] = {
                     "inst_id":      inst["id"],
                     "label":        inst["label"],
                     "direction":    direction,
@@ -587,19 +586,23 @@ def place_auto_trade(inst, analysis):
                     "sl_dist":      sl_dist,
                     "tp":           tp,
                     "tp_label":     label,
-                    "sl_moved":     False,
                     "lots":         lot,
                     "opened_at":    now_str,
                     "status":       "OPEN",
                     "signal_group": signal_group,
                 }
-                placed.append((tid, label, lot, tp))
+                placed.append((trade_id, label, tp))
+                log.info(f"Placed {label}: id={trade_id} lot={lot} tp={tp}")
+
+            except Exception as e:
+                log.error(f"Order [{label}] error: {e}")
+
             time.sleep(0.5)
 
         if not placed:
             return None
 
-        return signal_group, placed, tp1, tp2, tp3, lot1, lot2, lot3
+        return signal_group, placed, tp1, tp2, tp3, lot
 
     except Exception as e:
         log.error(f"place_auto_trade error: {e}")
@@ -663,18 +666,16 @@ def monitor_auto_trades(inst_id, current_price):
     dec  = inst["decimals"]
     trades_to_close = []
 
+    # Group by signal
     groups = {}
     for tid, trade in auto_trades.items():
-        if trade["inst_id"] != inst_id:
+        if trade["inst_id"] != inst_id or trade["status"] != "OPEN":
             continue
         sg = trade.get("signal_group", tid)
         groups.setdefault(sg, []).append((tid, trade))
 
-    for sg, group_trades in groups.items():
-        for trade_id, trade in group_trades:
-            if trade["status"] != "OPEN":
-                continue
-
+    for sg, group in groups.items():
+        for trade_id, trade in group:
             direction = trade["direction"]
             entry     = trade["entry"]
             sl        = trade["sl"]
@@ -686,22 +687,21 @@ def monitor_auto_trades(inst_id, current_price):
                 if price <= sl:
                     send_telegram(
                         f"🔴 *SL HIT — {trade['inst_id']} ({tp_label})*\n"
-                        f"Price `{round(price, dec)}` hit SL `{sl}`\n"
-                        f"Entry `{entry}` | Lots `{trade['lots']}`\n"
-                        f"_Stay disciplined — next setup incoming._"
+                        f"Price `{round(price,dec)}` | SL `{sl}` | Entry `{entry}`"
                     )
                     trades_to_close.append((trade_id, "sl_hit"))
                 elif price >= tp:
                     send_telegram(
                         f"✅ *{tp_label} HIT — {trade['inst_id']}*\n"
-                        f"Price `{round(price, dec)}` reached `{tp}`\n"
-                        f"💼 `{trade['lots']}` lots closed.\n"
-                        + ("🔒 _Moving remaining positions to breakeven._\n" if tp_label == "TP1" else "")
-                        + ("🏆 _Full runner target reached!_" if tp_label == "TP3" else "")
+                        f"Price `{round(price,dec)}` reached `{tp}`\n"
+                        f"💼 `{trade['lots']}` lots closed automatically."
+                        + ("\n🔒 _Moving remaining SL to breakeven._" if tp_label == "TP1" else "")
+                        + ("\n🏆 _Runner target reached!_" if tp_label == "TP3" else "")
                     )
                     trades_to_close.append((trade_id, f"{tp_label.lower()}_hit"))
+                    # Move SL to breakeven on TP2 and TP3 after TP1 hits
                     if tp_label == "TP1":
-                        for oid, ot in group_trades:
+                        for oid, ot in group:
                             if oid != trade_id and ot["status"] == "OPEN":
                                 move_sl_to_breakeven(oid)
 
@@ -709,22 +709,20 @@ def monitor_auto_trades(inst_id, current_price):
                 if price >= sl:
                     send_telegram(
                         f"🔴 *SL HIT — {trade['inst_id']} ({tp_label})*\n"
-                        f"Price `{round(price, dec)}` hit SL `{sl}`\n"
-                        f"Entry `{entry}` | Lots `{trade['lots']}`\n"
-                        f"_Stay disciplined — next setup incoming._"
+                        f"Price `{round(price,dec)}` | SL `{sl}` | Entry `{entry}`"
                     )
                     trades_to_close.append((trade_id, "sl_hit"))
                 elif price <= tp:
                     send_telegram(
                         f"✅ *{tp_label} HIT — {trade['inst_id']}*\n"
-                        f"Price `{round(price, dec)}` reached `{tp}`\n"
-                        f"💼 `{trade['lots']}` lots closed.\n"
-                        + ("🔒 _Moving remaining positions to breakeven._\n" if tp_label == "TP1" else "")
-                        + ("🏆 _Full runner target reached!_" if tp_label == "TP3" else "")
+                        f"Price `{round(price,dec)}` reached `{tp}`\n"
+                        f"💼 `{trade['lots']}` lots closed automatically."
+                        + ("\n🔒 _Moving remaining SL to breakeven._" if tp_label == "TP1" else "")
+                        + ("\n🏆 _Runner target reached!_" if tp_label == "TP3" else "")
                     )
                     trades_to_close.append((trade_id, f"{tp_label.lower()}_hit"))
                     if tp_label == "TP1":
-                        for oid, ot in group_trades:
+                        for oid, ot in group:
                             if oid != trade_id and ot["status"] == "OPEN":
                                 move_sl_to_breakeven(oid)
 
@@ -798,15 +796,15 @@ def format_auto_positions():
         price_str = str(round(price, 2)) if price else "N/A"
         emoji     = "🟢" if sample["direction"] == "BUY" else "🔴"
         lines.append(
-            f"{emoji} *{sample['inst_id']}* {sample['direction']} "
-            f"| Entry `{sample['entry']}` | Now `{price_str}`\n"
+            f"{emoji} *{sample['inst_id']}* {sample['direction']}\n"
+            f"📍 Entry `{sample['entry']}` | Now `{price_str}`\n"
             f"🛑 SL: `{sample['sl']}` | Opened: `{sample['opened_at']}`"
         )
         for tid, t in sorted(group, key=lambda x: x[1].get("tp_label", "")):
-            sl_str = "🔒 BE" if t["sl_moved"] else f"`{t['sl']}`"
+            sl_str = "🔒 BE" if t.get("sl_moved") else f"`{t['sl']}`"
             lines.append(
-                f"  • *{t.get('tp_label','TP')}*: `{t['tp']}` | "
-                f"Lots `{t['lots']}` | SL {sl_str}"
+                f"  • *{t.get('tp_label','TP')}*: `{t['tp']}` "
+                f"| `{t['lots']}` lots | SL {sl_str}"
             )
         lines.append("━━━━━━━━━━━━━━")
     return "\n".join(lines)
@@ -1155,21 +1153,20 @@ def analysis_loop():
                             if result:
                                 auto_placed = True
                                 stats["auto_trades_today"] += 1
-                                sg, placed, tp1, tp2, tp3, lot1, lot2, lot3 = result
-                                total_lot = round(lot1 + lot2 + lot3, 2)
-                                emoji     = "🟢" if sig == "BUY" else "🔴"
+                                sg, placed, tp1, tp2, tp3, lot = result
+                                emoji = "🟢" if sig == "BUY" else "🔴"
                                 send_telegram(
                                     f"🤖 *{len(placed)}/3 POSITIONS PLACED — {inst_id}*\n"
                                     f"{emoji} *{sig}* | ⭐ STRONG 🔥\n"
                                     f"━━━━━━━━━━━━━━\n"
-                                    f"📍 Entry:  `{analysis['entry']}`\n"
-                                    f"🛑 SL:     `{analysis['sl']}`\n"
-                                    f"🎯 TP1:    `{tp1}` | `{lot1}` lots _(50%)_\n"
-                                    f"🎯 TP2:    `{tp2}` | `{lot2}` lots _(30%)_\n"
-                                    f"🎯 TP3:    `{tp3}` | `{lot3}` lots _(20% runner)_\n"
-                                    f"💼 Total:  `{total_lot} lots` _(1% risk)_\n"
+                                    f"📍 Entry: `{analysis['entry']}`\n"
+                                    f"🛑 SL:    `{analysis['sl']}`\n"
+                                    f"🎯 TP1:   `{tp1}` | `{lot}` lots\n"
+                                    f"🎯 TP2:   `{tp2}` | `{lot}` lots\n"
+                                    f"🎯 TP3:   `{tp3}` | `{lot}` lots\n"
                                     f"━━━━━━━━━━━━━━\n"
                                     f"🔒 SL → breakeven after TP1\n"
+                                    f"_Each position closes at its own TP_\n"
                                     f"_Type `auto positions` to monitor_"
                                 )
                             else:
