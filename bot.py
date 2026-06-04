@@ -587,47 +587,77 @@ def place_auto_trade(inst, analysis):
         # Place 3 positions
         placed = []
         for tp, label in [(tp1, "TP1"), (tp2, "TP2"), (tp3, "TP3")]:
-            try:
-                payload = {
-                    "symbol":     mt5_symbol,
-                    "actionType": action,
-                    "volume":     lot,
-                    "stopLoss":   sl,
-                    "takeProfit": tp,
-                    "comment":    f"SMC-{label}"
-                }
-                url  = f"{META_API_URL}/users/current/accounts/{METAAPI_ACCOUNT_ID}/trade"
-                r    = requests.post(url, headers=metaapi_headers(), json=payload, timeout=15)
-                data = r.json()
-                log.info(f"MetaAPI [{label}]: {data}")
+            success = False
+            trade_id = None
+            for attempt in range(3):  # retry up to 3 times
+                try:
+                    payload = {
+                        "symbol":     mt5_symbol,
+                        "actionType": action,
+                        "volume":     lot,
+                        "stopLoss":   sl,
+                        "takeProfit": tp,
+                        "comment":    f"SMC-{label}"
+                    }
+                    url  = f"{META_API_URL}/users/current/accounts/{METAAPI_ACCOUNT_ID}/trade"
+                    r    = requests.post(url, headers=metaapi_headers(), json=payload, timeout=15)
+                    data = r.json()
+                    log.info(f"MetaAPI [{label}] attempt {attempt+1}: {data}")
 
-                trade_id = (
-                    data.get("orderId") or
-                    data.get("positionId") or
-                    data.get("tradeExecutionId") or
-                    f"{label}_{int(time.time())}"
-                )
+                    # Extract trade ID from any possible field
+                    trade_id = (
+                        data.get("orderId") or
+                        data.get("positionId") or
+                        data.get("tradeExecutionId")
+                    )
 
-                auto_trades[trade_id] = {
-                    "inst_id":      inst["id"],
-                    "label":        inst["label"],
-                    "direction":    direction,
-                    "entry":        entry,
-                    "sl":           sl,
-                    "sl_dist":      sl_dist,
-                    "tp":           tp,
-                    "tp_label":     label,
-                    "lots":         lot,
-                    "opened_at":    now_str,
-                    "status":       "OPEN",
-                    "signal_group": signal_group,
-                }
-                placed.append((trade_id, label, tp))
-                log.info(f"Placed {label}: id={trade_id} lot={lot} tp={tp}")
+                    # Check for explicit error
+                    if data.get("error") or (not trade_id and data.get("stringCode") not in (None, "TRADE_RETCODE_DONE", "ERR_NO_ERROR")):
+                        err_msg = data.get("message") or data.get("stringCode") or str(data)
+                        log.warning(f"MetaAPI [{label}] rejected: {err_msg}")
+                        if attempt == 2:
+                            # Send exact error to Telegram on final attempt
+                            send_telegram(
+                                f"⚠️ *MetaAPI order rejected — {inst['id']} {label}*\n"
+                                f"Error: `{err_msg}`\n"
+                                f"Payload: vol=`{lot}` sl=`{sl}` tp=`{tp}`\n"
+                                f"_Check Railway logs for full details._"
+                            )
+                        if attempt < 2:
+                            time.sleep(2)
+                            continue
 
-            except Exception as e:
-                log.error(f"Order [{label}] error: {e}")
+                    if trade_id:
+                        success = True
+                        break
+                    elif attempt < 2:
+                        time.sleep(2)
 
+                except Exception as e:
+                    log.error(f"Order [{label}] attempt {attempt+1} error: {e}")
+                    if attempt < 2:
+                        time.sleep(2)
+
+            if not success:
+                log.error(f"Failed to place {label} after 3 attempts")
+                continue
+
+            auto_trades[trade_id] = {
+                "inst_id":      inst["id"],
+                "label":        inst["label"],
+                "direction":    direction,
+                "entry":        entry,
+                "sl":           sl,
+                "sl_dist":      sl_dist,
+                "tp":           tp,
+                "tp_label":     label,
+                "lots":         lot,
+                "opened_at":    now_str,
+                "status":       "OPEN",
+                "signal_group": signal_group,
+            }
+            placed.append((trade_id, label, tp))
+            log.info(f"Placed {label}: id={trade_id} lot={lot} tp={tp}")
             time.sleep(0.5)
 
         if not placed:
@@ -1134,6 +1164,15 @@ def check_telegram_commands():
             elif msg == "auto off":
                 AUTO_TRADE_ENABLED = False
                 send_telegram("⏸ *Auto-trading DISABLED.*")
+            elif msg in ("auto clear", "auto reset"):
+                count = len(auto_trades)
+                auto_trades.clear()
+                profit_locked_groups.clear()
+                send_telegram(
+                    f"🗑 *Auto-trade memory cleared.*\n"
+                    f"Removed `{count}` tracked position(s).\n"
+                    f"_Bot will now accept new signals._"
+                )
             elif msg == "auto on":
                 AUTO_TRADE_ENABLED = True
                 stats["kill_switch_active"] = False
