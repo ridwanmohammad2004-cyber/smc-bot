@@ -56,7 +56,7 @@ META_API_URL = "https://mt-client-api-v1.london.agiliumtrade.ai"
 INSTRUMENTS = [
     {"id": "XAUUSD", "label": "Gold",    "symbol": "XAU/USD",  "td_symbol": "XAU/USD",
      "decimals": 2,  "sl_dist": 6.0,    "lot_strong": 0.05, "lot_mid": 0.02,
-     "valid_min": 1000,  "valid_max": 10000},
+     "valid_min": 1000,  "valid_max": 10000, "buy_only": True},
     {"id": "NAS100", "label": "Nasdaq",  "symbol": "US100",    "td_symbol": "NDX",
      "decimals": 1,  "sl_dist": 20.0,   "lot_strong": 0.2,  "lot_mid": 0.1,
      "valid_min": 10000, "valid_max": 40000},
@@ -542,15 +542,51 @@ def place_auto_trade(inst, analysis):
     if stats.get("kill_switch_active"):
         return None
 
-    # Max open signals guard — count unique signal groups
-    active_groups = set(t.get("signal_group") for t in auto_trades.values() if t.get("signal_group"))
-    if len(active_groups) >= MAX_OPEN_POSITIONS:
-        send_telegram(
-            f"⏸ *Auto-trade skipped — {inst['id']}*\n"
-            f"Already have {len(active_groups)} active signal(s).\n"
-            f"_Signal valid — place manually if desired._"
-        )
-        return None
+    # Smart position guard:
+    # - If existing trades are in profit → allow new trade (stack the winner)
+    # - If existing trades are in a loss → block new trade
+    # - If no existing trades → allow
+    if auto_trades:
+        price = latest_price.get(inst["id"])
+        if price:
+            # Check if any open trade is currently losing
+            any_losing = False
+            for trade in auto_trades.values():
+                if trade.get("inst_id") != inst["id"]:
+                    continue
+                if trade.get("status") != "OPEN":
+                    continue
+                pnl = 0
+                entry_p = trade.get("entry", price)
+                lot     = trade.get("lots", 0.01)
+                pv      = {"XAUUSD": 100.0, "NAS100": 1.0, "EURUSD": 100000.0, "USOUSD": 1000.0}.get(inst["id"], 100.0)
+                if trade.get("direction") == "BUY":
+                    pnl = (price - entry_p) * pv * lot
+                else:
+                    pnl = (entry_p - price) * pv * lot
+                if pnl < 0:
+                    any_losing = True
+                    break
+
+            if any_losing:
+                send_telegram(
+                    f"⏸ *Auto-trade skipped — {inst['id']}*\n"
+                    f"Existing position is in a loss — waiting for it to close first.\n"
+                    f"_Signal valid — place manually if desired._"
+                )
+                return None
+            # Existing trades are winning — allow stacking
+            log.info(f"Existing positions in profit — stacking new signal")
+        else:
+            # No live price available — be safe and block
+            active_groups = set(t.get("signal_group") for t in auto_trades.values() if t.get("signal_group"))
+            if active_groups:
+                send_telegram(
+                    f"⏸ *Auto-trade skipped — {inst['id']}*\n"
+                    f"Already have {len(active_groups)} active signal(s).\n"
+                    f"_Signal valid — place manually if desired._"
+                )
+                return None
 
     try:
         direction    = analysis["signal"]
