@@ -55,7 +55,7 @@ META_API_URL = "https://mt-client-api-v1.london.agiliumtrade.ai"
 # ─── INSTRUMENTS ──────────────────────────────────────────
 INSTRUMENTS = [
     {"id": "XAUUSD", "label": "Gold",    "symbol": "XAU/USD",  "td_symbol": "XAU/USD",
-     "decimals": 2,  "sl_dist": 3.5,    "lot_strong": 0.05, "lot_mid": 0.02,
+     "decimals": 2,  "sl_dist": 6.0,    "lot_strong": 0.05, "lot_mid": 0.02,
      "valid_min": 1000,  "valid_max": 10000},
     {"id": "NAS100", "label": "Nasdaq",  "symbol": "US100",    "td_symbol": "NDX",
      "decimals": 1,  "sl_dist": 20.0,   "lot_strong": 0.2,  "lot_mid": 0.1,
