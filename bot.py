@@ -853,6 +853,41 @@ def monitor_auto_trades(inst_id, current_price):
         groups.setdefault(sg, []).append((tid, trade))
 
     for sg, group in groups.items():
+
+        # ── TREND REVERSAL EXIT: If BUY trade and downtrend detected — close all ──
+        if group:
+            _, sample = group[0]
+            if sample["direction"] == "BUY":
+                candles = candle_store.get(inst_id, [])
+                if len(candles) >= 10:
+                    structure = get_structure_candles(candles)
+                    if structure == "BEARISH":
+                        # Check if trade is in profit before closing
+                        pnl = live_profit(sample, current_price)
+                        already_flagged = sample.get("reversal_flagged", False)
+
+                        if not already_flagged:
+                            # Flag all positions in this group to avoid repeat triggers
+                            for tid, t in group:
+                                if tid in auto_trades:
+                                    auto_trades[tid]["reversal_flagged"] = True
+
+                            pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+                            send_telegram(
+                                f"🔄 *TREND REVERSAL — CLOSING BUY — {inst_id}*\n"
+                                f"━━━━━━━━━━━━━━\n"
+                                f"📉 1M structure shifted to *BEARISH*\n"
+                                f"🚪 Closing all {len(group)} positions immediately\n"
+                                f"💰 Current P&L: `{pnl_str}`\n"
+                                f"━━━━━━━━━━━━━━\n"
+                                f"_Exiting before trend works against you._"
+                            )
+                            for tid, t in group:
+                                if tid in auto_trades:
+                                    trades_to_close.append((tid, "trend_reversal"))
+                            # Skip normal TP/SL checks for this group
+                            continue
+
         # ── PROFIT LOCK: close first position at +$5, move others to BE ──
         if sg not in profit_locked_groups:
             # All positions share entry/lot so live profit is the same — use first
@@ -1031,9 +1066,13 @@ def format_auto_history():
         return "📭 *No closed auto-trades yet.*"
     lines = ["📜 *Last Closed Auto-Trades*\n"]
     reason_map = {
-        "tp3_hit":     "🏆 TP3 Hit", "tp2_hit": "✅ TP2 Hit",
-        "tp1_hit":     "✅ TP1 Hit", "sl_hit":  "🔴 SL Hit",
-        "profit_lock": "💰 +$5 Locked", "manual": "🖐 Manual",
+        "tp3_hit":        "🏆 TP3 Hit",
+        "tp2_hit":        "✅ TP2 Hit",
+        "tp1_hit":        "✅ TP1 Hit",
+        "sl_hit":         "🔴 SL Hit",
+        "profit_lock":    "💰 +$5 Locked",
+        "trend_reversal": "🔄 Trend Exit",
+        "manual":         "🖐 Manual",
     }
     for t in reversed(auto_trade_history[-6:]):
         emoji   = "🟢" if t["direction"] == "BUY" else "🔴"
